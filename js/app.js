@@ -49,7 +49,7 @@ function seedDefaultRegistrations() {
 async function initTesseract() {
   setOcrStatus('Loading OCR engine…', true);
   try {
-    tesseractWorker = await Tesseract.createWorker('eng', 1, {
+    tesseractWorker = await Tesseract.createWorker('eng', 1 /* OEM_LSTM_ONLY */, {
       logger: () => {} // suppress verbose logs
     });
     await tesseractWorker.setParameters({
@@ -92,8 +92,9 @@ async function handleFileSelected(file) {
   resetResult();
   regInput.value = '';
 
-  // Show preview
+  // Show preview — only assign blob: URLs produced by createObjectURL
   const objectUrl = URL.createObjectURL(file);
+  if (!objectUrl.startsWith('blob:')) return;
   previewImg.src = objectUrl;
   previewImg.style.display = 'block';
   previewPlaceholder.style.display = 'none';
@@ -134,7 +135,7 @@ async function runOCR(imageSource) {
 
 /** Strip spaces, punctuation and uppercase */
 function cleanRegistration(raw) {
-  return raw.replace(/[^A-Z0-9]/gi, '').toUpperCase().trim();
+  return raw.replace(/[^A-Z0-9]/gi, '').toUpperCase();
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────

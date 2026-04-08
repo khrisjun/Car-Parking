@@ -132,9 +132,10 @@ importFile.addEventListener('change', (e) => {
       return;
     }
 
-    const existing = getRegistrations().map(normalise);
+    const current = getRegistrations();
+    const existing = current.map(normalise);
     const newOnes = lines.filter(r => !existing.includes(r));
-    const merged = [...getRegistrations(), ...newOnes];
+    const merged = [...current, ...newOnes];
     saveRegistrations(merged);
     renderList();
     showToast(`Imported ${newOnes.length} new registration${newOnes.length !== 1 ? 's' : ''}.`);

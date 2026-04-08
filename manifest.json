@@ -2,7 +2,7 @@
   "name": "Car Parking Validator",
   "short_name": "Car Parking",
   "description": "Scan a number plate and check if the vehicle is authorised to park.",
-  "start_url": "/",
+  "start_url": "./",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#f3f4f6",
