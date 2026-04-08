@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="theme-color" content="#1a56db" />
+  <meta name="description" content="Scan a car registration plate and check if it is authorised to park." />
+  <title>Car Parking Validator</title>
+
+  <!-- PWA manifest -->
+  <link rel="manifest" href="manifest.json" />
+
+  <!-- Styles -->
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <header class="app-header">
+    <span class="logo" aria-hidden="true">🚗</span>
+    <div>
+      <h1>Car Parking Validator</h1>
+      <p>Scan or upload a number plate to check parking permission</p>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <!-- ── Step 1: Capture image ── -->
+    <section class="card" aria-labelledby="capture-title">
+      <p class="card-title" id="capture-title">Step 1 — Capture Registration</p>
+
+      <div class="capture-area">
+        <!-- Image preview -->
+        <div class="preview-box" role="img" aria-label="Captured number plate image">
+          <div class="preview-placeholder" id="preview-placeholder" aria-hidden="true">
+            <span class="icon">📷</span>
+            <span>No image yet</span>
+          </div>
+          <img id="preview-img" alt="Captured registration plate" />
+        </div>
+
+        <!-- Camera / Upload buttons -->
+        <div class="btn-row">
+          <button id="btn-camera" class="btn btn-primary" type="button">
+            📷 Take Photo
+          </button>
+          <button id="btn-upload" class="btn btn-secondary" type="button">
+            📁 Upload Image
+          </button>
+        </div>
+
+        <!-- Hidden file inputs -->
+        <input id="camera-input" type="file" accept="image/*" capture="environment" class="hidden" aria-hidden="true" />
+        <input id="upload-input" type="file" accept="image/*" class="hidden" aria-hidden="true" />
+
+        <!-- OCR progress message -->
+        <div class="ocr-status" id="ocr-status" aria-live="polite" aria-atomic="true"></div>
+      </div>
+    </section>
+
+    <!-- ── Step 2: Confirm / enter registration ── -->
+    <section class="card" aria-labelledby="confirm-title">
+      <p class="card-title" id="confirm-title">Step 2 — Confirm Registration</p>
+
+      <div class="reg-input-group">
+        <label for="reg-input">Registration Number</label>
+        <input
+          id="reg-input"
+          class="reg-input"
+          type="text"
+          maxlength="10"
+          placeholder="e.g. AB12CDE"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="characters"
+          spellcheck="false"
+          inputmode="text"
+          aria-label="Registration number"
+        />
+        <p class="reg-input-hint">OCR result shown above — edit if needed, then validate.</p>
+      </div>
+    </section>
+
+    <!-- ── Step 3: Validate ── -->
+    <section class="card" aria-labelledby="validate-title">
+      <p class="card-title" id="validate-title">Step 3 — Check Parking</p>
+      <button id="validate-btn" class="btn btn-success" type="button">
+        🔍 Check Parking Permission
+      </button>
+    </section>
+
+    <!-- ── Result ── -->
+    <section
+      id="result-card"
+      class="card result-card hidden"
+      aria-live="assertive"
+      aria-atomic="true"
+      role="status"
+      aria-labelledby="result-message"
+    >
+      <span id="result-icon" class="result-icon" aria-hidden="true"></span>
+      <span id="result-badge" class="result-badge"></span>
+      <p id="result-message" class="result-message"></p>
+      <p id="result-sub" class="result-sub"></p>
+      <button id="try-again-btn" class="btn btn-secondary btn-sm" type="button" style="margin-top:0.5rem;">
+        ↩ Check Another
+      </button>
+    </section>
+
+    <!-- ── Admin link ── -->
+    <div class="admin-link">
+      <a href="admin.html">⚙️ Manage Registrations</a>
+    </div>
+
+  </main>
+
+  <!-- Toast notification -->
+  <div id="toast" class="toast" role="alert" aria-live="assertive"></div>
+
+  <!-- Tesseract.js OCR library (runs entirely in the browser) -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+  <!-- App data & logic -->
+  <script src="js/registrations.js"></script>
+  <script src="js/app.js"></script>
+
+  <!-- PWA: register service worker -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./service-worker.js');
+    }
+  </script>
+
+</body>
+</html>
