@@ -92,9 +92,8 @@ async function handleFileSelected(file) {
   resetResult();
   regInput.value = '';
 
-  // Show preview — only assign blob: URLs produced by createObjectURL
+  // Show preview
   const objectUrl = URL.createObjectURL(file);
-  if (!objectUrl.startsWith('blob:')) return;
   previewImg.src = objectUrl;
   previewImg.style.display = 'block';
   previewPlaceholder.style.display = 'none';
@@ -149,7 +148,7 @@ regInput.addEventListener('keydown', (e) => {
 
 /** Normalise registration for comparison */
 function normalise(reg) {
-  return reg.replace(/\s/g, '').toUpperCase().trim();
+  return reg.replace(/\s/g, '').toUpperCase();
 }
 
 function validate() {

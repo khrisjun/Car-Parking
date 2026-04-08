@@ -159,7 +159,7 @@ function saveRegistrations(regs) {
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────
 function normalise(reg) {
-  return reg.replace(/\s/g, '').toUpperCase().trim();
+  return reg.replace(/\s/g, '').toUpperCase();
 }
 
 function escapeHtml(str) {
