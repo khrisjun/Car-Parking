@@ -13,5 +13,6 @@ const DEFAULT_REGISTRATIONS = [
   'MR22SBT',
   'CU19ADL',
   'HV73QRE',
-  'JN68VWM'
+  'JN68VWM',
+  'VE73KWK'
 ];

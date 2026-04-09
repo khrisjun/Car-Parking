@@ -195,9 +195,17 @@ async function runOCR(imageSource) {
       }
     }
 
-    const best = bestInRange || bestAny;
+    let best = bestInRange || bestAny;
 
     if (best.length > 0) {
+      // Apply UK plate format positional character corrections (O↔0, I↔1, etc.)
+      best = correctOcrForUKPlate(best);
+
+      // Fuzzy-match against stored registrations (edit distance ≤ 1) to catch
+      // single-character misreads such as W being read as H
+      const fuzzy = findFuzzyMatch(best, getRegistrations());
+      if (fuzzy) best = fuzzy;
+
       regInput.value = best;
       setOcrStatus(`Detected: ${best}`, false);
     } else {
@@ -214,6 +222,63 @@ async function runOCR(imageSource) {
 /** Strip spaces, punctuation and uppercase */
 function cleanRegistration(raw) {
   return raw.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+}
+
+/**
+ * Apply positional character corrections for the standard UK plate format
+ * LL00LLL (2 letters, 2 digits, 3 letters).  OCR commonly confuses visually
+ * similar characters: O/0, I/1, S/5, B/8, Z/2, G/6, A/4.
+ * Only applied when the candidate is exactly 7 characters.
+ */
+function correctOcrForUKPlate(text) {
+  if (text.length !== 7) return text;
+  const DIGIT_TO_LETTER = { '0': 'O', '1': 'I', '5': 'S', '8': 'B', '2': 'Z', '6': 'G', '4': 'A' };
+  const LETTER_TO_DIGIT = { O: '0', I: '1', L: '1', S: '5', B: '8', Z: '2', G: '6', A: '4', T: '1' };
+  const chars = text.split('');
+  // Positions 0,1,4,5,6 should be letters – fix any stray digit
+  [0, 1, 4, 5, 6].forEach(i => {
+    if (/[0-9]/.test(chars[i]) && DIGIT_TO_LETTER[chars[i]]) {
+      chars[i] = DIGIT_TO_LETTER[chars[i]];
+    }
+  });
+  // Positions 2,3 should be digits – fix any stray letter
+  [2, 3].forEach(i => {
+    if (/[A-Z]/.test(chars[i]) && LETTER_TO_DIGIT[chars[i]]) {
+      chars[i] = LETTER_TO_DIGIT[chars[i]];
+    }
+  });
+  return chars.join('');
+}
+
+/** Levenshtein edit distance between two strings */
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) => {
+    const row = new Array(n + 1).fill(0);
+    row[0] = i;
+    return row;
+  });
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i][j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1][j - 1]
+        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+    }
+  }
+  return dp[m][n];
+}
+
+/**
+ * Find a stored registration within edit-distance 1 of the candidate.
+ * Returns the matched registration (normalised) or null.
+ */
+function findFuzzyMatch(candidate, registrations) {
+  for (const reg of registrations) {
+    const norm = normalise(reg);
+    if (levenshtein(candidate, norm) <= 1) return norm;
+  }
+  return null;
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
