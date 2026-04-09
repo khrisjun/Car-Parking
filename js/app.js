@@ -11,7 +11,10 @@
 'use strict';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const STORAGE_KEY = 'carpark_registrations';
+const STORAGE_KEY        = 'carpark_registrations';
+const CONTRAST_BOOST     = 1.6;  // multiplier applied during OCR image preprocessing
+const MIN_PLATE_LENGTH   = 5;    // shortest plausible registration (e.g. "A1BCR")
+const MAX_PLATE_LENGTH   = 8;    // longest plausible registration (e.g. "AB12 CDE")
 
 // ─── DOM References ───────────────────────────────────────────────────────────
 const cameraInput    = document.getElementById('camera-input');
@@ -55,7 +58,6 @@ async function initTesseract() {
     await tesseractWorker.setParameters({
       tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
       preserve_interword_spaces: '0',
-      tessedit_pageseg_mode: '7' // treat as single line
     });
     workerReady = true;
     setOcrStatus('OCR engine ready', false);
@@ -104,6 +106,60 @@ async function handleFileSelected(file) {
 
 // ─── OCR ──────────────────────────────────────────────────────────────────────
 
+/**
+ * Preprocess an image for OCR:
+ *  - Resize to a manageable width (full-res camera photos overwhelm Tesseract)
+ *  - Convert to grayscale and boost contrast so the plate stands out
+ *
+ * Returns a data-URL of the processed image.
+ */
+async function preprocessImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const MAX_W = 1600;
+      const MAX_H = 900;
+      let w = img.naturalWidth  || img.width;
+      let h = img.naturalHeight || img.height;
+
+      // Shrink if necessary while preserving aspect ratio
+      if (w > MAX_W || h > MAX_H) {
+        const ratio = Math.min(MAX_W / w, MAX_H / h);
+        w = Math.round(w * ratio);
+        h = Math.round(h * ratio);
+      }
+
+      const canvas = document.createElement('canvas');
+      canvas.width  = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, w, h);
+
+      // Grayscale + contrast boost
+      const imgData = ctx.getImageData(0, 0, w, h);
+      const d = imgData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        // Linear contrast stretch centred at 128
+        gray = Math.min(255, Math.max(0, (gray - 128) * CONTRAST_BOOST + 128));
+        d[i] = d[i + 1] = d[i + 2] = gray;
+      }
+      ctx.putImageData(imgData, 0, 0);
+
+      resolve(canvas.toDataURL('image/png'));
+    };
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+/**
+ * Run OCR using multiple Tesseract page-segmentation modes (PSM) and return
+ * the best non-empty result.  PSMs tried, in priority order:
+ *   8 – single word  (best for a compact plate like "AB12CDE")
+ *   7 – single text line
+ *  11 – sparse text  (fallback when plate is small in a large photo)
+ */
 async function runOCR(imageSource) {
   if (!workerReady) {
     setOcrStatus('OCR not ready. Please type the registration manually.', false);
@@ -114,13 +170,25 @@ async function runOCR(imageSource) {
   validateBtn.disabled = true;
 
   try {
-    const { data } = await tesseractWorker.recognize(imageSource);
-    const raw = data.text || '';
-    const cleaned = cleanRegistration(raw);
+    const processed = await preprocessImage(imageSource);
 
-    if (cleaned.length > 0) {
-      regInput.value = cleaned;
-      setOcrStatus(`Detected: ${cleaned}`, false);
+    const PSM_MODES = ['8', '7', '11'];
+    let best = '';
+
+    for (const psm of PSM_MODES) {
+      await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
+      const { data } = await tesseractWorker.recognize(processed);
+      const candidate = cleanRegistration(data.text || '');
+      if (candidate.length > best.length) {
+        best = candidate;
+      }
+      // Stop early if we have a plausible plate (5–8 alphanumeric chars)
+      if (best.length >= MIN_PLATE_LENGTH && best.length <= MAX_PLATE_LENGTH) break;
+    }
+
+    if (best.length > 0) {
+      regInput.value = best;
+      setOcrStatus(`Detected: ${best}`, false);
     } else {
       setOcrStatus('Could not detect registration. Please type it manually.', false);
     }

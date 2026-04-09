@@ -50,6 +50,15 @@ body {
 
 .app-header .logo {
   font-size: 1.75rem;
+  flex-shrink: 0;
+}
+
+.header-logo {
+  width: 2.5rem;
+  height: 2.5rem;
+  border-radius: 6px;
+  display: block;
+  object-fit: contain;
 }
 
 .app-header h1 {
