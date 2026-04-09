@@ -11,7 +11,10 @@
 'use strict';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const STORAGE_KEY = 'carpark_registrations';
+const STORAGE_KEY        = 'carpark_registrations';
+const CONTRAST_BOOST     = 1.6;  // multiplier applied during OCR image preprocessing
+const MIN_PLATE_LENGTH   = 5;    // shortest plausible registration (e.g. "A1BCR")
+const MAX_PLATE_LENGTH   = 8;    // longest plausible registration (e.g. "AB12 CDE")
 
 // ─── DOM References ───────────────────────────────────────────────────────────
 const cameraInput    = document.getElementById('camera-input');
@@ -53,7 +56,7 @@ async function initTesseract() {
       logger: () => {} // suppress verbose logs
     });
     await tesseractWorker.setParameters({
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ',
+      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
       preserve_interword_spaces: '0',
     });
     workerReady = true;
@@ -138,7 +141,7 @@ async function preprocessImage(src) {
       for (let i = 0; i < d.length; i += 4) {
         let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
         // Linear contrast stretch centred at 128
-        gray = Math.min(255, Math.max(0, (gray - 128) * 1.6 + 128));
+        gray = Math.min(255, Math.max(0, (gray - 128) * CONTRAST_BOOST + 128));
         d[i] = d[i + 1] = d[i + 2] = gray;
       }
       ctx.putImageData(imgData, 0, 0);
@@ -180,7 +183,7 @@ async function runOCR(imageSource) {
         best = candidate;
       }
       // Stop early if we have a plausible plate (5–8 alphanumeric chars)
-      if (best.length >= 5 && best.length <= 8) break;
+      if (best.length >= MIN_PLATE_LENGTH && best.length <= MAX_PLATE_LENGTH) break;
     }
 
     if (best.length > 0) {
