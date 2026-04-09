@@ -271,11 +271,11 @@ function levenshtein(a, b) {
 
 /**
  * Find a stored registration within edit-distance 1 of the candidate.
- * Returns the matched registration (normalised) or null.
+ * Returns the matched registration (normalised, spaces stripped) or null.
  */
 function findFuzzyMatch(candidate, registrations) {
   for (const reg of registrations) {
-    const norm = normalise(reg);
+    const norm = reg.replace(/\s/g, '').toUpperCase();
     if (levenshtein(candidate, norm) <= 1) return norm;
   }
   return null;
