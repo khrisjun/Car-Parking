@@ -12,9 +12,9 @@
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const STORAGE_KEY        = 'carpark_registrations';
-const CONTRAST_BOOST     = 1.6;  // multiplier applied during OCR image preprocessing
 const MIN_PLATE_LENGTH   = 5;    // shortest plausible registration (e.g. "A1BCR")
 const MAX_PLATE_LENGTH   = 8;    // longest plausible registration (e.g. "AB12 CDE")
+const OCR_TARGET_WIDTH   = 1600; // target width for pre-processed image fed to Tesseract
 
 // ─── DOM References ───────────────────────────────────────────────────────────
 const cameraInput    = document.getElementById('camera-input');
@@ -52,7 +52,9 @@ function seedDefaultRegistrations() {
 async function initTesseract() {
   setOcrStatus('Loading OCR engine…', true);
   try {
-    tesseractWorker = await Tesseract.createWorker('eng', 1 /* OEM_LSTM_ONLY */, {
+    // OEM 3 = LSTM + legacy engine combined — more robust than LSTM-only for
+    // difficult characters such as W vs H or partial reads
+    tesseractWorker = await Tesseract.createWorker('eng', 3 /* OEM_DEFAULT */, {
       logger: () => {} // suppress verbose logs
     });
     await tesseractWorker.setParameters({
@@ -107,46 +109,126 @@ async function handleFileSelected(file) {
 // ─── OCR ──────────────────────────────────────────────────────────────────────
 
 /**
- * Preprocess an image for OCR:
- *  - Resize to a manageable width (full-res camera photos overwhelm Tesseract)
- *  - Convert to grayscale and boost contrast so the plate stands out
+ * Compute Otsu's optimal binarisation threshold for a grayscale pixel array.
+ * This adaptive method picks the threshold that maximises between-class
+ * variance, giving a clean black-and-white image regardless of lighting.
+ */
+function computeOtsuThreshold(pixels) {
+  const histogram = new Array(256).fill(0);
+  for (const v of pixels) histogram[v]++;
+  const total = pixels.length;
+
+  let sum = 0;
+  for (let i = 0; i < 256; i++) sum += i * histogram[i];
+
+  let sumB = 0, wB = 0, maxVar = 0, threshold = 128;
+  for (let t = 0; t < 256; t++) {
+    wB += histogram[t];
+    if (wB === 0) continue;
+    const wF = total - wB;
+    if (wF === 0) break;
+    sumB += t * histogram[t];
+    const mB = sumB / wB;
+    const mF = (sum - sumB) / wF;
+    const varBetween = wB * wF * (mB - mF) ** 2;
+    if (varBetween > maxVar) { maxVar = varBetween; threshold = t; }
+  }
+  return threshold;
+}
+
+/**
+ * Apply a 3×3 sharpening (Laplacian) kernel to a grayscale pixel array.
+ * Sharpening makes character edges crisper, which helps Tesseract distinguish
+ * visually similar glyphs such as W and H.
+ */
+function applySharpening(gray, w, h) {
+  const out = new Uint8Array(gray);
+  // Laplacian sharpening kernel: centre weight 5, cardinal neighbours -1
+  for (let y = 1; y < h - 1; y++) {
+    for (let x = 1; x < w - 1; x++) {
+      const i = y * w + x;
+      const val = 5 * gray[i]
+        - gray[i - w] - gray[i + w]
+        - gray[i - 1] - gray[i + 1];
+      out[i] = Math.min(255, Math.max(0, val));
+    }
+  }
+  return out;
+}
+
+/**
+ * Preprocess an image for OCR and return two data-URLs: one normal (dark
+ * characters on light background) and one inverted (light on dark).
  *
- * Returns a data-URL of the processed image.
+ * Pipeline:
+ *   1. Scale image DOWN to OCR_TARGET_WIDTH if it is wider (large camera
+ *      photos have more pixels than Tesseract can handle efficiently).
+ *      Upscaling is intentionally skipped — interpolated pixels add no detail.
+ *   2. Convert to grayscale.
+ *   3. Sharpen with a Laplacian kernel to accentuate character edges.
+ *   4. Binarise using Otsu's adaptive threshold for a clean black-and-white
+ *      image regardless of ambient lighting conditions.
+ *   5. Produce an inverted copy (some plates have light characters on a dark
+ *      surface and Tesseract prefers dark-on-light).
  */
 async function preprocessImage(src) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
-      const MAX_W = 1600;
-      const MAX_H = 900;
       let w = img.naturalWidth  || img.width;
       let h = img.naturalHeight || img.height;
 
-      // Shrink if necessary while preserving aspect ratio
-      if (w > MAX_W || h > MAX_H) {
-        const ratio = Math.min(MAX_W / w, MAX_H / h);
-        w = Math.round(w * ratio);
-        h = Math.round(h * ratio);
+      // Only scale DOWN large photos; upscaling merely interpolates pixels and
+      // does not give Tesseract more real detail.
+      if (w > OCR_TARGET_WIDTH) {
+        const scale = OCR_TARGET_WIDTH / w;
+        w = OCR_TARGET_WIDTH;
+        h = Math.round(h * scale);
       }
 
       const canvas = document.createElement('canvas');
       canvas.width  = w;
       canvas.height = h;
       const ctx = canvas.getContext('2d');
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = 'high';
       ctx.drawImage(img, 0, 0, w, h);
 
-      // Grayscale + contrast boost
+      // --- Grayscale ---
       const imgData = ctx.getImageData(0, 0, w, h);
       const d = imgData.data;
-      for (let i = 0; i < d.length; i += 4) {
-        let gray = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-        // Linear contrast stretch centred at 128
-        gray = Math.min(255, Math.max(0, (gray - 128) * CONTRAST_BOOST + 128));
-        d[i] = d[i + 1] = d[i + 2] = gray;
+      const gray = new Uint8Array(w * h);
+      for (let i = 0; i < w * h; i++) {
+        gray[i] = Math.round(0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]);
       }
-      ctx.putImageData(imgData, 0, 0);
 
-      resolve(canvas.toDataURL('image/png'));
+      // --- Sharpen ---
+      const sharpened = applySharpening(gray, w, h);
+
+      // --- Otsu binarisation ---
+      const threshold = computeOtsuThreshold(sharpened);
+
+      // Build normal (dark text on white) image
+      const normalData = ctx.createImageData(w, h);
+      const invertData = ctx.createImageData(w, h);
+      for (let i = 0; i < w * h; i++) {
+        const val    = sharpened[i] > threshold ? 255 : 0;
+        const invVal = 255 - val;
+        normalData.data[i * 4]     = normalData.data[i * 4 + 1] = normalData.data[i * 4 + 2] = val;
+        normalData.data[i * 4 + 3] = 255;
+        invertData.data[i * 4]     = invertData.data[i * 4 + 1] = invertData.data[i * 4 + 2] = invVal;
+        invertData.data[i * 4 + 3] = 255;
+      }
+
+      // Render normal image to canvas → data-URL
+      ctx.putImageData(normalData, 0, 0);
+      const normalUrl = canvas.toDataURL('image/png');
+
+      // Render inverted image to canvas → data-URL
+      ctx.putImageData(invertData, 0, 0);
+      const invertUrl = canvas.toDataURL('image/png');
+
+      resolve({ normalUrl, invertUrl });
     };
     img.onerror = reject;
     img.src = src;
@@ -154,17 +236,21 @@ async function preprocessImage(src) {
 }
 
 /**
- * Run OCR using multiple Tesseract page-segmentation modes (PSM) and return
- * the best non-empty result.  PSMs tried, in priority order:
- *   7 – single text line (best for a standard plate like "GF23 XWD")
- *   8 – single word      (compact plates with no space)
- *  11 – sparse text      (fallback when plate is small in a large photo)
+ * Run OCR using multiple Tesseract page-segmentation modes (PSM) on both the
+ * normal and the inverted preprocessed image, then return the best result.
  *
- * All modes are always tried so a partial result from an earlier mode never
- * masks a better result from a later mode.  Among all candidates the one
- * whose length falls inside [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH] and is
- * longest wins; only if no candidate lands in that range do we fall back to
- * the longest raw result.
+ * PSMs tried:
+ *   6  – uniform block of text (good for plates with clear borders)
+ *   7  – single text line      (best for a standard plate like "GF23 XWD")
+ *   8  – single word           (compact plates with no space)
+ *  13  – raw line              (treats image as a single text line, no layout)
+ *
+ * Each mode is run on both the normal and inverted preprocessed image (8
+ * passes total).  Running both polarities handles dark-on-light and
+ * light-on-dark plates; the extra passes are the main accuracy trade-off
+ * versus processing time.  On modern mobile hardware each pass takes ~1–2 s.
+ * MAX_PLATE_LENGTH] and is longest wins; only if no candidate lands in that
+ * range do we fall back to the longest raw result.
  */
 async function runOCR(imageSource) {
   if (!workerReady) {
@@ -176,23 +262,28 @@ async function runOCR(imageSource) {
   validateBtn.disabled = true;
 
   try {
-    const processed = await preprocessImage(imageSource);
+    const { normalUrl, invertUrl } = await preprocessImage(imageSource);
 
-    const PSM_MODES = ['7', '8', '11'];
+    // PSM modes ordered from most to least specific for a plate
+    const PSM_MODES = ['7', '6', '8', '13'];
     let bestInRange = '';  // longest candidate within [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH]
     let bestAny     = '';  // longest candidate regardless of length (fallback)
 
+    const tryCandidate = (raw) => {
+      const candidate = cleanRegistration(raw || '');
+      const inRange = candidate.length >= MIN_PLATE_LENGTH && candidate.length <= MAX_PLATE_LENGTH;
+      if (inRange && candidate.length > bestInRange.length) bestInRange = candidate;
+      if (candidate.length > bestAny.length) bestAny = candidate;
+    };
+
     for (const psm of PSM_MODES) {
       await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
-      const { data } = await tesseractWorker.recognize(processed);
-      const candidate = cleanRegistration(data.text || '');
-      const inRange = candidate.length >= MIN_PLATE_LENGTH && candidate.length <= MAX_PLATE_LENGTH;
-      if (inRange && candidate.length > bestInRange.length) {
-        bestInRange = candidate;
-      }
-      if (candidate.length > bestAny.length) {
-        bestAny = candidate;
-      }
+      // Run on the standard (dark text on white) preprocessed image
+      const { data: dataNormal } = await tesseractWorker.recognize(normalUrl);
+      tryCandidate(dataNormal.text);
+      // Run on the inverted image to handle light-coloured characters on dark plates
+      const { data: dataInvert } = await tesseractWorker.recognize(invertUrl);
+      tryCandidate(dataInvert.text);
     }
 
     let best = bestInRange || bestAny;
