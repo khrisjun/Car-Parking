@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <meta name="theme-color" content="#111827" />
+  <meta name="description" content="Manage the list of vehicles authorised to park." />
+  <title>Admin – Car Parking Validator</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+
+  <!-- ── Header ── -->
+  <header class="admin-header">
+    <span aria-hidden="true">⚙️</span>
+    <h1>Manage Registrations</h1>
+    <a href="index.html">← Back to App</a>
+  </header>
+
+  <main class="container">
+
+    <!-- ── Add new registration ── -->
+    <section class="card" aria-labelledby="add-title">
+      <p class="card-title" id="add-title">Add Registration</p>
+      <div class="add-form">
+        <input
+          id="add-input"
+          type="text"
+          maxlength="10"
+          placeholder="e.g. AB12CDE"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="characters"
+          spellcheck="false"
+          inputmode="text"
+          aria-label="New registration number"
+        />
+        <button id="add-btn" class="btn btn-primary" type="button" style="flex:0 0 auto;">
+          + Add
+        </button>
+      </div>
+    </section>
+
+    <!-- ── Registered vehicles ── -->
+    <section class="card" aria-labelledby="list-title">
+      <p class="card-title" id="list-title">Registered Vehicles</p>
+      <p id="reg-count" class="reg-count"></p>
+      <ul id="reg-list" class="reg-list" aria-label="List of registered vehicles"></ul>
+    </section>
+
+    <!-- ── Import / Export ── -->
+    <section class="card" aria-labelledby="import-export-title">
+      <p class="card-title" id="import-export-title">Import / Export</p>
+      <p style="font-size:0.85rem;color:var(--color-text-muted);margin-bottom:0.75rem;">
+        CSV format — one registration per line.
+      </p>
+      <div class="import-export-row">
+        <button id="export-btn" class="btn btn-secondary btn-sm" type="button">⬇ Export CSV</button>
+        <button id="import-btn" class="btn btn-secondary btn-sm" type="button">⬆ Import CSV</button>
+        <input id="import-file" type="file" accept=".csv,.txt" class="hidden" aria-hidden="true" />
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Toast notification -->
+  <div id="toast" class="toast" role="alert" aria-live="assertive"></div>
+
+  <!-- App data & admin logic -->
+  <script src="js/registrations.js"></script>
+  <script src="js/admin.js"></script>
+
+  <!-- PWA: register service worker -->
+  <script>
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('./service-worker.js');
+    }
+  </script>
+
+</body>
+</html>
