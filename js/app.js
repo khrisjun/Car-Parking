@@ -156,9 +156,15 @@ async function preprocessImage(src) {
 /**
  * Run OCR using multiple Tesseract page-segmentation modes (PSM) and return
  * the best non-empty result.  PSMs tried, in priority order:
- *   8 – single word  (best for a compact plate like "AB12CDE")
- *   7 – single text line
- *  11 – sparse text  (fallback when plate is small in a large photo)
+ *   7 – single text line (best for a standard plate like "GF23 XWD")
+ *   8 – single word      (compact plates with no space)
+ *  11 – sparse text      (fallback when plate is small in a large photo)
+ *
+ * All modes are always tried so a partial result from an earlier mode never
+ * masks a better result from a later mode.  Among all candidates the one
+ * whose length falls inside [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH] and is
+ * longest wins; only if no candidate lands in that range do we fall back to
+ * the longest raw result.
  */
 async function runOCR(imageSource) {
   if (!workerReady) {
@@ -172,19 +178,24 @@ async function runOCR(imageSource) {
   try {
     const processed = await preprocessImage(imageSource);
 
-    const PSM_MODES = ['8', '7', '11'];
-    let best = '';
+    const PSM_MODES = ['7', '8', '11'];
+    let bestInRange = '';  // longest candidate within [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH]
+    let bestAny     = '';  // longest candidate regardless of length (fallback)
 
     for (const psm of PSM_MODES) {
       await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
       const { data } = await tesseractWorker.recognize(processed);
       const candidate = cleanRegistration(data.text || '');
-      if (candidate.length > best.length) {
-        best = candidate;
+      const inRange = candidate.length >= MIN_PLATE_LENGTH && candidate.length <= MAX_PLATE_LENGTH;
+      if (inRange && candidate.length > bestInRange.length) {
+        bestInRange = candidate;
       }
-      // Stop early if we have a plausible plate (5–8 alphanumeric chars)
-      if (best.length >= MIN_PLATE_LENGTH && best.length <= MAX_PLATE_LENGTH) break;
+      if (candidate.length > bestAny.length) {
+        bestAny = candidate;
+      }
     }
+
+    const best = bestInRange || bestAny;
 
     if (best.length > 0) {
       regInput.value = best;
