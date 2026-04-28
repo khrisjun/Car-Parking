@@ -14,13 +14,27 @@
 const STORAGE_KEY        = 'carpark_registrations';
 const MIN_PLATE_LENGTH   = 5;    // shortest plausible registration (e.g. "A1BCR")
 const MAX_PLATE_LENGTH   = 8;    // longest plausible registration (e.g. "AB12 CDE")
-const OCR_TARGET_WIDTH   = 1600; // target width for pre-processed image fed to Tesseract
+const OCR_PLATE_WIDTH    = 800;  // target width when scaling a detected plate crop for OCR
+const OCR_FULL_WIDTH     = 1200; // max width when falling back to full-image OCR (downscale only)
+const PLATE_DETECT_WIDTH = 640;  // working resolution for the plate-detection algorithm
+
+// ─── Plate-detection tuning parameters ───────────────────────────────────────
+// These constants control detectPlateRegion() and can be adjusted to improve
+// detection accuracy for different camera angles or lighting conditions.
+const SOBEL_THRESH       = 50;   // edge binarisation threshold; lower → more sensitive
+const ROW_DENSITY_THRESH = 0.15; // min fraction of a row's pixels that must be active
+const PLATE_TARGET_AR    = 4.7;  // ideal aspect ratio: UK standard plate 520 × 111 mm
+const PLATE_MIN_AR       = 2.0;  // minimum accepted aspect ratio (covers motorcycle plates)
+const PLATE_MAX_AR       = 8.5;  // maximum accepted aspect ratio
+const PLATE_MIN_WIDTH_PC = 0.15; // plate must span ≥ this fraction of image width
+const AR_SCORE_WEIGHT    = 3;    // aspect-ratio score weight vs. area score (higher = prefer AR)
 
 // ─── DOM References ───────────────────────────────────────────────────────────
 const cameraInput    = document.getElementById('camera-input');
 const uploadInput    = document.getElementById('upload-input');
 const previewImg     = document.getElementById('preview-img');
 const previewPlaceholder = document.getElementById('preview-placeholder');
+const plateOverlay   = document.getElementById('plate-overlay');
 const ocrStatus      = document.getElementById('ocr-status');
 const regInput       = document.getElementById('reg-input');
 const validateBtn    = document.getElementById('validate-btn');
@@ -108,6 +122,216 @@ async function handleFileSelected(file) {
 
 // ─── OCR ──────────────────────────────────────────────────────────────────────
 
+/** Load an Image element from a URL; resolves with the element once ready. */
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload  = () => resolve(img);
+    img.onerror = reject;
+    img.src     = src;
+  });
+}
+
+/**
+ * Detect the most likely number plate region in an image.
+ *
+ * Returns a Promise<{x,y,w,h}|null> in original-image pixel coordinates.
+ * Returns null when no plausible candidate is found; the caller then falls
+ * back to running OCR on the full image.
+ *
+ * Algorithm (all processing at PLATE_DETECT_WIDTH for speed):
+ *   1. Downscale to PLATE_DETECT_WIDTH.
+ *   2. Convert to greyscale.
+ *   3. Compute Sobel-X magnitude (highlights vertical character strokes,
+ *      which are the dominant edge feature on a number plate).
+ *   4. Binarise at SOBEL_THRESH.
+ *   5. Dilate horizontally (≈2.5 % of working width) to merge per-character
+ *      blobs into a single contiguous stripe.
+ *   6. Dilate vertically  (≈1.5 % of working height) to merge character rows.
+ *   7. Compute per-row edge density; group consecutive dense rows into bands.
+ *   8. For each band find the x-extent of active pixels.
+ *   9. Filter by aspect ratio PLATE_MIN_AR → PLATE_MAX_AR and minimum width
+ *      PLATE_MIN_WIDTH_PC.  UK standard plates are ≈ 4.7 : 1 (520 × 111 mm).
+ *  10. Score by closeness to the standard UK plate aspect ratio and region area.
+ *  11. Pad the winning candidate (5 % horizontal, 20 % vertical) to avoid
+ *      clipping descenders, then scale back to original coordinates.
+ */
+async function detectPlateRegion(imageSource) {
+  let img;
+  try { img = await loadImage(imageSource); } catch { return null; }
+
+  const origW = img.naturalWidth  || img.width;
+  const origH = img.naturalHeight || img.height;
+  const scale = Math.min(1, PLATE_DETECT_WIDTH / origW);
+  const dw    = Math.round(origW * scale);
+  const dh    = Math.round(origH * scale);
+
+  const c   = document.createElement('canvas');
+  c.width   = dw;
+  c.height  = dh;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(img, 0, 0, dw, dh);
+  const { data } = ctx.getImageData(0, 0, dw, dh);
+
+  // ── Greyscale – ITU-R BT.601 luma weights scaled to integer arithmetic ──────
+  const gray = new Uint8Array(dw * dh);
+  for (let i = 0; i < dw * dh; i++) {
+    gray[i] = (data[i * 4] * 77 + data[i * 4 + 1] * 150 + data[i * 4 + 2] * 29) >> 8;
+  }
+
+  // ── Sobel-X magnitude (vertical character strokes) ────────────────────────
+  const sobel = new Uint8Array(dw * dh);
+  for (let y = 1; y < dh - 1; y++) {
+    for (let x = 1; x < dw - 1; x++) {
+      const gx =
+        -gray[(y - 1) * dw + (x - 1)] + gray[(y - 1) * dw + (x + 1)] +
+        -2 * gray[y * dw + (x - 1)]   + 2 * gray[y * dw + (x + 1)] +
+        -gray[(y + 1) * dw + (x - 1)] + gray[(y + 1) * dw + (x + 1)];
+      sobel[y * dw + x] = Math.min(255, Math.abs(gx));
+    }
+  }
+
+  // ── Binarise using module-level SOBEL_THRESH ──────────────────────────────
+  const binary = new Uint8Array(dw * dh);
+  for (let i = 0; i < dw * dh; i++) {
+    binary[i] = sobel[i] > SOBEL_THRESH ? 1 : 0;
+  }
+
+  // ── Horizontal dilation – connect character vertical edges ─────────────────
+  const dilW  = Math.max(5, Math.round(dw * 0.025));
+  const hDil  = new Uint8Array(dw * dh);
+  for (let y = 0; y < dh; y++) {
+    for (let x = 0; x < dw; x++) {
+      let on = 0;
+      for (let dx = -dilW; dx <= dilW && !on; dx++) {
+        const nx = x + dx;
+        if (nx >= 0 && nx < dw) on = binary[y * dw + nx];
+      }
+      hDil[y * dw + x] = on;
+    }
+  }
+
+  // ── Vertical dilation – merge character rows into a plate band ─────────────
+  const dilH = Math.max(3, Math.round(dh * 0.015));
+  const vDil = new Uint8Array(dw * dh);
+  for (let y = 0; y < dh; y++) {
+    for (let x = 0; x < dw; x++) {
+      let on = 0;
+      for (let dy = -dilH; dy <= dilH && !on; dy++) {
+        const ny = y + dy;
+        if (ny >= 0 && ny < dh) on = hDil[ny * dw + x];
+      }
+      vDil[y * dw + x] = on;
+    }
+  }
+
+  // ── Group consecutive dense rows into horizontal bands ─────────────────────
+  const bands = [];
+  let inBand = false, bandStart = 0;
+  for (let y = 0; y < dh; y++) {
+    let count = 0;
+    for (let x = 0; x < dw; x++) count += vDil[y * dw + x];
+    const dense = (count / dw) >= ROW_DENSITY_THRESH;
+    if (dense  && !inBand) { inBand = true;  bandStart = y; }
+    if (!dense &&  inBand) { inBand = false; bands.push({ y0: bandStart, y1: y - 1 }); }
+  }
+  if (inBand) bands.push({ y0: bandStart, y1: dh - 1 });
+
+  // ── Filter bands by aspect ratio ───────────────────────────────────────────
+  const candidates = [];
+  for (const band of bands) {
+    let minX = dw, maxX = 0;
+    for (let y = band.y0; y <= band.y1; y++) {
+      for (let x = 0; x < dw; x++) {
+        if (vDil[y * dw + x]) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+        }
+      }
+    }
+    if (maxX <= minX) continue;
+    const bw = maxX - minX + 1;
+    const bh = band.y1 - band.y0 + 1;
+    const ar = bw / bh;
+    if (ar < PLATE_MIN_AR || ar > PLATE_MAX_AR)   continue;
+    if (bw < dw * PLATE_MIN_WIDTH_PC)             continue;
+
+    const arScore  = 1 / (1 + Math.abs(ar - PLATE_TARGET_AR));
+    const areaNorm = (bw * bh) / (dw * dh);
+    candidates.push({ x: minX, y: band.y0, w: bw, h: bh, score: arScore * AR_SCORE_WEIGHT + areaNorm });
+  }
+
+  if (candidates.length === 0) return null;
+
+  candidates.sort((a, b) => b.score - a.score);
+  const best = candidates[0];
+
+  // Pad to avoid clipping edges and character descenders
+  const padX = Math.round(best.w * 0.05);
+  const padY = Math.round(best.h * 0.20);
+  const cx   = Math.max(0, best.x - padX);
+  const cy   = Math.max(0, best.y - padY);
+  const cw   = Math.min(dw - cx, best.w + 2 * padX);
+  const ch   = Math.min(dh - cy, best.h + 2 * padY);
+
+  // Scale back to original-image coordinates
+  return {
+    x: Math.round(cx / scale),
+    y: Math.round(cy / scale),
+    w: Math.round(cw / scale),
+    h: Math.round(ch / scale),
+  };
+}
+
+/**
+ * Draw a translucent bounding-box overlay on the preview image showing where
+ * the plate detector found the plate.  Helps users understand and debug OCR.
+ */
+function drawPlateOverlay(plateRegion, naturalW, naturalH) {
+  if (!plateOverlay) return;
+  if (!plateRegion) { plateOverlay.style.display = 'none'; return; }
+
+  // The <canvas> sits on top of the <img> which uses object-fit:contain inside
+  // a fixed-size preview-box.  We need to map plate coords (in original image
+  // pixels) to the rendered pixel position of the <img> element.
+  const boxW = previewImg.clientWidth;
+  const boxH = previewImg.clientHeight;
+  const imgAR = naturalW / naturalH;
+  const boxAR = boxW   / boxH;
+
+  let renderedW, renderedH, offsetX, offsetY;
+  if (imgAR > boxAR) {
+    renderedW = boxW;
+    renderedH = boxW / imgAR;
+    offsetX   = 0;
+    offsetY   = (boxH - renderedH) / 2;
+  } else {
+    renderedH = boxH;
+    renderedW = boxH * imgAR;
+    offsetX   = (boxW - renderedW) / 2;
+    offsetY   = 0;
+  }
+
+  const scaleX = renderedW / naturalW;
+  const scaleY = renderedH / naturalH;
+
+  plateOverlay.width  = boxW;
+  plateOverlay.height = boxH;
+  plateOverlay.style.display = 'block';
+
+  const ctx = plateOverlay.getContext('2d');
+  ctx.clearRect(0, 0, boxW, boxH);
+  ctx.strokeStyle = '#00ff88';
+  ctx.lineWidth   = 3;
+  ctx.setLineDash([6, 3]);
+  ctx.strokeRect(
+    offsetX + plateRegion.x * scaleX,
+    offsetY + plateRegion.y * scaleY,
+    plateRegion.w * scaleX,
+    plateRegion.h * scaleY
+  );
+}
+
 /**
  * Compute Otsu's optimal binarisation threshold for a grayscale pixel array.
  * This adaptive method picks the threshold that maximises between-class
@@ -157,100 +381,110 @@ function applySharpening(gray, w, h) {
 }
 
 /**
- * Preprocess an image for OCR and return two data-URLs: one normal (dark
- * characters on light background) and one inverted (light on dark).
+ * Preprocess an image for OCR.
  *
  * Pipeline:
- *   1. Scale image DOWN to OCR_TARGET_WIDTH if it is wider (large camera
- *      photos have more pixels than Tesseract can handle efficiently).
- *      Upscaling is intentionally skipped — interpolated pixels add no detail.
- *   2. Convert to grayscale.
- *   3. Sharpen with a Laplacian kernel to accentuate character edges.
- *   4. Binarise using Otsu's adaptive threshold for a clean black-and-white
- *      image regardless of ambient lighting conditions.
- *   5. Produce an inverted copy (some plates have light characters on a dark
- *      surface and Tesseract prefers dark-on-light).
+ *   1. Detect the plate region with detectPlateRegion() (or use the full image
+ *      as a fallback when no plausible plate is found).
+ *   2. Crop the image to that region.
+ *   3. Scale the crop to OCR_PLATE_WIDTH (always — upscaling a small crop gives
+ *      Tesseract more pixels to classify; downscaling removes noise from very
+ *      large camera images).  Full-image fallback is capped at OCR_FULL_WIDTH.
+ *   4. Convert to greyscale.
+ *   5. Sharpen with the Laplacian kernel to accentuate character edges.
+ *   6. Binarise with Otsu's adaptive threshold.
+ *   7. Produce both a normal (dark-on-light) and an inverted copy (some plates
+ *      have light characters on a dark surface; Tesseract prefers dark-on-light).
+ *
+ * Returns { normalUrl, invertUrl, plateRegion } where plateRegion is the
+ * detected crop rectangle ({x,y,w,h}) or null for full-image fallback.
  */
 async function preprocessImage(src) {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => {
-      let w = img.naturalWidth  || img.width;
-      let h = img.naturalHeight || img.height;
+  const plateRegion = await detectPlateRegion(src);
+  const img         = await loadImage(src);
 
-      // Only scale DOWN large photos; upscaling merely interpolates pixels and
-      // does not give Tesseract more real detail.
-      if (w > OCR_TARGET_WIDTH) {
-        const scale = OCR_TARGET_WIDTH / w;
-        w = OCR_TARGET_WIDTH;
-        h = Math.round(h * scale);
-      }
+  const fullW = img.naturalWidth  || img.width;
+  const fullH = img.naturalHeight || img.height;
 
-      const canvas = document.createElement('canvas');
-      canvas.width  = w;
-      canvas.height = h;
-      const ctx = canvas.getContext('2d');
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(img, 0, 0, w, h);
+  // Determine the crop and target OCR width
+  let cropX, cropY, cropW, cropH, targetW;
+  if (plateRegion) {
+    cropX   = plateRegion.x;
+    cropY   = plateRegion.y;
+    cropW   = plateRegion.w;
+    cropH   = plateRegion.h;
+    targetW = OCR_PLATE_WIDTH;             // scale crop to this width (up or down)
+  } else {
+    cropX   = 0;
+    cropY   = 0;
+    cropW   = fullW;
+    cropH   = fullH;
+    targetW = Math.min(fullW, OCR_FULL_WIDTH); // downscale only for full image
+  }
 
-      // --- Grayscale ---
-      const imgData = ctx.getImageData(0, 0, w, h);
-      const d = imgData.data;
-      const gray = new Uint8Array(w * h);
-      for (let i = 0; i < w * h; i++) {
-        gray[i] = Math.round(0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]);
-      }
+  const scale = targetW / cropW;
+  const w     = targetW;
+  const h     = Math.round(cropH * scale);
 
-      // --- Sharpen ---
-      const sharpened = applySharpening(gray, w, h);
+  const canvas = document.createElement('canvas');
+  canvas.width  = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = 'high';
+  // Draw only the plate crop, scaled to fill canvas
+  ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, w, h);
 
-      // --- Otsu binarisation ---
-      const threshold = computeOtsuThreshold(sharpened);
+  // --- Grayscale ---
+  const imgData = ctx.getImageData(0, 0, w, h);
+  const d = imgData.data;
+  const gray = new Uint8Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    gray[i] = Math.round(0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]);
+  }
 
-      // Build normal (dark text on white) image
-      const normalData = ctx.createImageData(w, h);
-      const invertData = ctx.createImageData(w, h);
-      for (let i = 0; i < w * h; i++) {
-        const val    = sharpened[i] > threshold ? 255 : 0;
-        const invVal = 255 - val;
-        normalData.data[i * 4]     = normalData.data[i * 4 + 1] = normalData.data[i * 4 + 2] = val;
-        normalData.data[i * 4 + 3] = 255;
-        invertData.data[i * 4]     = invertData.data[i * 4 + 1] = invertData.data[i * 4 + 2] = invVal;
-        invertData.data[i * 4 + 3] = 255;
-      }
+  // --- Sharpen ---
+  const sharpened = applySharpening(gray, w, h);
 
-      // Render normal image to canvas → data-URL
-      ctx.putImageData(normalData, 0, 0);
-      const normalUrl = canvas.toDataURL('image/png');
+  // --- Otsu binarisation ---
+  const threshold = computeOtsuThreshold(sharpened);
 
-      // Render inverted image to canvas → data-URL
-      ctx.putImageData(invertData, 0, 0);
-      const invertUrl = canvas.toDataURL('image/png');
+  // Build normal (dark text on white) image
+  const normalData = ctx.createImageData(w, h);
+  const invertData = ctx.createImageData(w, h);
+  for (let i = 0; i < w * h; i++) {
+    const val    = sharpened[i] > threshold ? 255 : 0;
+    const invVal = 255 - val;
+    normalData.data[i * 4]     = normalData.data[i * 4 + 1] = normalData.data[i * 4 + 2] = val;
+    normalData.data[i * 4 + 3] = 255;
+    invertData.data[i * 4]     = invertData.data[i * 4 + 1] = invertData.data[i * 4 + 2] = invVal;
+    invertData.data[i * 4 + 3] = 255;
+  }
 
-      resolve({ normalUrl, invertUrl });
-    };
-    img.onerror = reject;
-    img.src = src;
-  });
+  // Render normal image to canvas → data-URL
+  ctx.putImageData(normalData, 0, 0);
+  const normalUrl = canvas.toDataURL('image/png');
+
+  // Render inverted image to canvas → data-URL
+  ctx.putImageData(invertData, 0, 0);
+  const invertUrl = canvas.toDataURL('image/png');
+
+  return { normalUrl, invertUrl, plateRegion, naturalW: fullW, naturalH: fullH };
 }
 
 /**
  * Run OCR using multiple Tesseract page-segmentation modes (PSM) on both the
- * normal and the inverted preprocessed image, then return the best result.
+ * normal and the inverted preprocessed plate crop, then return the best result.
  *
- * PSMs tried:
- *   6  – uniform block of text (good for plates with clear borders)
- *   7  – single text line      (best for a standard plate like "GF23 XWD")
- *   8  – single word           (compact plates with no space)
- *  13  – raw line              (treats image as a single text line, no layout)
+ * When a plate region is detected, only PSM 7, 8, and 13 are tried
+ * (3 modes × 2 polarities = 6 passes total) because the tight crop makes
+ * block-mode PSMs unreliable.  Without a crop the full four-mode sweep is
+ * retained as a fallback.
  *
- * Each mode is run on both the normal and inverted preprocessed image (8
- * passes total).  Running both polarities handles dark-on-light and
- * light-on-dark plates; the extra passes are the main accuracy trade-off
- * versus processing time.  On modern mobile hardware each pass takes ~1–2 s.
- * MAX_PLATE_LENGTH] and is longest wins; only if no candidate lands in that
- * range do we fall back to the longest raw result.
+ * PSM 7  – single text line  (best for a standard plate like "GF23 XWD")
+ * PSM 8  – single word       (compact plates with no visible space)
+ * PSM 13 – raw line          (no layout analysis; treats image as one line)
+ * PSM 6  – uniform text block (fallback for full-image mode only)
  */
 async function runOCR(imageSource) {
   if (!workerReady) {
@@ -258,14 +492,26 @@ async function runOCR(imageSource) {
     return;
   }
 
-  setOcrStatus('Reading registration…', true);
+  setOcrStatus('Detecting number plate…', true);
   validateBtn.disabled = true;
 
   try {
-    const { normalUrl, invertUrl } = await preprocessImage(imageSource);
+    const { normalUrl, invertUrl, plateRegion, naturalW, naturalH } = await preprocessImage(imageSource);
 
-    // PSM modes ordered from most to least specific for a plate
-    const PSM_MODES = ['7', '6', '8', '13'];
+    // Show (or hide) the detection overlay on the preview
+    drawPlateOverlay(plateRegion, naturalW, naturalH);
+
+    if (plateRegion) {
+      console.info('[OCR] Plate detected at', plateRegion);
+    } else {
+      console.warn('[OCR] No plate region detected — running OCR on full image');
+    }
+
+    setOcrStatus('Reading registration…', true);
+
+    // Tight crop → single-line modes are most accurate.
+    // Full-image fallback → also try block mode to catch plates with context.
+    const PSM_MODES = plateRegion ? ['7', '8', '13'] : ['7', '6', '8', '13'];
     let bestInRange = '';  // longest candidate within [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH]
     let bestAny     = '';  // longest candidate regardless of length (fallback)
 
@@ -280,9 +526,11 @@ async function runOCR(imageSource) {
       await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
       // Run on the standard (dark text on white) preprocessed image
       const { data: dataNormal } = await tesseractWorker.recognize(normalUrl);
+      console.debug(`[OCR] PSM ${psm} normal: "${dataNormal.text.trim()}"`);
       tryCandidate(dataNormal.text);
       // Run on the inverted image to handle light-coloured characters on dark plates
       const { data: dataInvert } = await tesseractWorker.recognize(invertUrl);
+      console.debug(`[OCR] PSM ${psm} invert: "${dataInvert.text.trim()}"`);
       tryCandidate(dataInvert.text);
     }
 
@@ -298,7 +546,8 @@ async function runOCR(imageSource) {
       if (fuzzy) best = fuzzy;
 
       regInput.value = best;
-      setOcrStatus(`Detected: ${best}`, false);
+      const regionNote = plateRegion ? '' : ' (full image — plate not isolated)';
+      setOcrStatus(`Detected: ${best}${regionNote}`, false);
     } else {
       setOcrStatus('Could not detect registration. Please type it manually.', false);
     }
@@ -439,6 +688,7 @@ tryAgainBtn.addEventListener('click', () => {
   setOcrStatus('', false);
   cameraInput.value = '';
   uploadInput.value = '';
+  if (plateOverlay) plateOverlay.style.display = 'none';
   // Scroll back to top
   window.scrollTo({ top: 0, behavior: 'smooth' });
 });
