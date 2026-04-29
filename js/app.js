@@ -558,7 +558,6 @@ async function runOCR(imageSource) {
       tryCandidate(dataNormal.text);
       // Early exit: a valid-length plate was found — no further passes needed
       if (bestInRange.length > 0) break;
-      if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS) break;
       // Run on the inverted image to handle light-coloured characters on dark plates
       const remainingMs2 = Math.max(0, OCR_TIME_BUDGET_MS - (performance.now() - ocrStart));
       const { data: dataInvert } = await recognizeWithTimeout(invertUrl, remainingMs2);
@@ -566,18 +565,6 @@ async function runOCR(imageSource) {
       tryCandidate(dataInvert.text);
       // Early exit after inverted pass too
       if (bestInRange.length > 0) break;
-    }
-
-    const elapsedMs = performance.now() - ocrStart;
-    if (elapsedMs > OCR_TIME_BUDGET_MS) {
-      console.warn(`[OCR] Time budget exceeded (${Math.round(elapsedMs)}ms); stopping early`);
-      setOcrStatus('OCR taking too long — showing best result so far.', false);
-      // Terminate the current worker and mark it unready so the next OCR attempt
-      // can re-initialise it without racing this attempt's final status message.
-      try {
-        await tesseractWorker.terminate();
-      } catch {}
-      workerReady = false;
     }
 
     let best = bestInRange || bestAny;
