@@ -548,12 +548,12 @@ async function runOCR(imageSource) {
     if (elapsedMs > OCR_TIME_BUDGET_MS) {
       console.warn(`[OCR] Time budget exceeded (${Math.round(elapsedMs)}ms); stopping early`);
       setOcrStatus('OCR taking too long — showing best result so far.', false);
-      // Terminate & re-init so future attempts don't inherit a wedged worker.
+      // Terminate the current worker and mark it unready so the next OCR attempt
+      // can re-initialise it without racing this attempt's final status message.
       try {
         await tesseractWorker.terminate();
       } catch {}
       workerReady = false;
-      initTesseract();
     }
 
     let best = bestInRange || bestAny;
