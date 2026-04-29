@@ -18,6 +18,9 @@ const OCR_PLATE_WIDTH    = 800;  // target width when scaling a detected plate c
 const OCR_FULL_WIDTH     = 1200; // max width when falling back to full-image OCR (downscale only)
 const PLATE_DETECT_WIDTH = 640;  // working resolution for the plate-detection algorithm
 
+// Hard limit so OCR can't "cycle" for a minute; target is < 5s.
+const OCR_TIME_BUDGET_MS = 5000;
+
 // ─── Plate-detection tuning parameters ───────────────────────────────────────
 // These constants control detectPlateRegion() and can be adjusted to improve
 // detection accuracy for different camera angles or lighting conditions.
@@ -509,6 +512,10 @@ async function runOCR(imageSource) {
 
     setOcrStatus('Reading registration…', true);
 
+    // Enforce a strict time budget. If we exceed it, stop trying further PSM
+    // passes and (best-effort) terminate the worker so users aren't stuck.
+    const ocrStart = performance.now();
+
     // Tight crop → single-line modes are most accurate.
     // Full-image fallback → also try block mode to catch plates with context.
     const PSM_MODES = plateRegion ? ['7', '8', '13'] : ['7', '6', '8', '13'];
@@ -523,15 +530,30 @@ async function runOCR(imageSource) {
     };
 
     for (const psm of PSM_MODES) {
+      if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS) break;
       await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
       // Run on the standard (dark text on white) preprocessed image
       const { data: dataNormal } = await tesseractWorker.recognize(normalUrl);
       console.debug(`[OCR] PSM ${psm} normal: "${dataNormal.text.trim()}"`);
       tryCandidate(dataNormal.text);
+
+      if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS) break;
       // Run on the inverted image to handle light-coloured characters on dark plates
       const { data: dataInvert } = await tesseractWorker.recognize(invertUrl);
       console.debug(`[OCR] PSM ${psm} invert: "${dataInvert.text.trim()}"`);
       tryCandidate(dataInvert.text);
+    }
+
+    const elapsedMs = performance.now() - ocrStart;
+    if (elapsedMs > OCR_TIME_BUDGET_MS) {
+      console.warn(`[OCR] Time budget exceeded (${Math.round(elapsedMs)}ms); stopping early`);
+      setOcrStatus('OCR taking too long — showing best result so far.', false);
+      // Terminate & re-init so future attempts don't inherit a wedged worker.
+      try {
+        await tesseractWorker.terminate();
+      } catch {}
+      workerReady = false;
+      initTesseract();
     }
 
     let best = bestInRange || bestAny;
