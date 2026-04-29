@@ -586,12 +586,16 @@ async function runOCR(imageSource) {
     }
   } catch (err) {
     if (err && err.message === 'OCR_TIMEOUT') {
-      console.warn('[OCR] Timed out; terminating worker');
+      console.warn('[OCR] Timed out; terminating worker and re-initialising');
       setOcrStatus('OCR taking too long — please type the registration manually.', false);
       try {
         await tesseractWorker.terminate();
       } catch {}
+      tesseractWorker = null;
       workerReady = false;
+      // Re-initialise in the background so the next scan attempt works
+      // without requiring a manual page refresh.
+      initTesseract();
       return;
     }
     console.error('OCR error:', err);

@@ -3,7 +3,7 @@
  * Caches app shell files so the app can work offline after first load.
  */
 
-const CACHE_NAME = 'carpark-v4';
+const CACHE_NAME = 'carpark-v5';
 
 const APP_SHELL = [
   './',
