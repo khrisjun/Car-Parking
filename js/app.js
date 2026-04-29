@@ -21,6 +21,17 @@ const PLATE_DETECT_WIDTH = 640;  // working resolution for the plate-detection a
 // Hard limit so OCR can't "cycle" for a minute; target is < 5s.
 const OCR_TIME_BUDGET_MS = 5000;
 
+function timeoutAfter(ms) {
+  return new Promise((_, reject) => setTimeout(() => reject(new Error('OCR_TIMEOUT')), ms));
+}
+
+async function recognizeWithTimeout(imageUrl, ms) {
+  return Promise.race([
+    tesseractWorker.recognize(imageUrl),
+    timeoutAfter(ms),
+  ]);
+}
+
 // ─── Plate-detection tuning parameters ───────────────────────────────────────
 // These constants control detectPlateRegion() and can be adjusted to improve
 // detection accuracy for different camera angles or lighting conditions.
@@ -533,13 +544,15 @@ async function runOCR(imageSource) {
       if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS) break;
       await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
       // Run on the standard (dark text on white) preprocessed image
-      const { data: dataNormal } = await tesseractWorker.recognize(normalUrl);
+      const remainingMs1 = Math.max(0, OCR_TIME_BUDGET_MS - (performance.now() - ocrStart));
+      const { data: dataNormal } = await recognizeWithTimeout(normalUrl, remainingMs1);
       console.debug(`[OCR] PSM ${psm} normal: "${dataNormal.text.trim()}"`);
       tryCandidate(dataNormal.text);
 
       if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS) break;
       // Run on the inverted image to handle light-coloured characters on dark plates
-      const { data: dataInvert } = await tesseractWorker.recognize(invertUrl);
+      const remainingMs2 = Math.max(0, OCR_TIME_BUDGET_MS - (performance.now() - ocrStart));
+      const { data: dataInvert } = await recognizeWithTimeout(invertUrl, remainingMs2);
       console.debug(`[OCR] PSM ${psm} invert: "${dataInvert.text.trim()}"`);
       tryCandidate(dataInvert.text);
     }
@@ -574,6 +587,15 @@ async function runOCR(imageSource) {
       setOcrStatus('Could not detect registration. Please type it manually.', false);
     }
   } catch (err) {
+    if (err && err.message === 'OCR_TIMEOUT') {
+      console.warn('[OCR] Timed out; terminating worker');
+      setOcrStatus('OCR taking too long — please type the registration manually.', false);
+      try {
+        await tesseractWorker.terminate();
+      } catch {}
+      workerReady = false;
+      return;
+    }
     console.error('OCR error:', err);
     setOcrStatus('OCR failed. Please type the registration manually.', false);
   } finally {
