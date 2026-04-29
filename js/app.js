@@ -66,9 +66,11 @@ function seedDefaultRegistrations() {
 async function initTesseract() {
   setOcrStatus('Loading OCR engine…', true);
   try {
-    // OEM 3 = LSTM + legacy engine combined — more robust than LSTM-only for
-    // difficult characters such as W vs H or partial reads
-    tesseractWorker = await Tesseract.createWorker('eng', 3 /* OEM_DEFAULT */, {
+    // OEM 1 = LSTM neural net only — substantially faster than the combined
+    // LSTM+legacy engine (OEM 3) while retaining excellent accuracy for
+    // high-contrast plate crops.  Positional correction and fuzzy matching
+    // downstream handle the rare character confusions (W/H, O/0, etc.).
+    tesseractWorker = await Tesseract.createWorker('eng', 1 /* OEM_LSTM_ONLY */, {
       logger: () => {} // suppress verbose logs
     });
     await tesseractWorker.setParameters({
@@ -476,10 +478,16 @@ async function preprocessImage(src) {
  * Run OCR using multiple Tesseract page-segmentation modes (PSM) on both the
  * normal and the inverted preprocessed plate crop, then return the best result.
  *
- * When a plate region is detected, only PSM 7, 8, and 13 are tried
- * (3 modes × 2 polarities = 6 passes total) because the tight crop makes
- * block-mode PSMs unreliable.  Without a crop the full four-mode sweep is
- * retained as a fallback.
+ * Passes are tried in order and the loop exits as soon as any pass returns a
+ * candidate within [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH].  For a clear plate
+ * crop (the common case) this means only one recognize() call is needed,
+ * keeping total OCR time well under five seconds.  Subsequent modes serve as
+ * automatic fallbacks for awkward lighting or unusual plate layouts.
+ *
+ * When a plate region is detected, PSM 7, 8 and 13 are tried (up to
+ * 3 modes × 2 polarities = 6 passes) because the tight crop makes block-mode
+ * PSMs unreliable.  Without a crop the full four-mode sweep is retained as a
+ * fallback.
  *
  * PSM 7  – single text line  (best for a standard plate like "GF23 XWD")
  * PSM 8  – single word       (compact plates with no visible space)
@@ -528,10 +536,14 @@ async function runOCR(imageSource) {
       const { data: dataNormal } = await tesseractWorker.recognize(normalUrl);
       console.debug(`[OCR] PSM ${psm} normal: "${dataNormal.text.trim()}"`);
       tryCandidate(dataNormal.text);
+      // Early exit: a valid-length plate was found — no further passes needed
+      if (bestInRange.length > 0) break;
       // Run on the inverted image to handle light-coloured characters on dark plates
       const { data: dataInvert } = await tesseractWorker.recognize(invertUrl);
       console.debug(`[OCR] PSM ${psm} invert: "${dataInvert.text.trim()}"`);
       tryCandidate(dataInvert.text);
+      // Early exit after inverted pass too
+      if (bestInRange.length > 0) break;
     }
 
     let best = bestInRange || bestAny;

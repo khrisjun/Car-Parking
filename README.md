@@ -26,9 +26,11 @@ preprocessImage()
   produces normal + inverted data-URLs
      │
      ▼
-Tesseract.js (PSM 7, 8, 13 on plate crop; adds PSM 6 for full-image fallback)
+Tesseract.js OEM 1 (LSTM only) – faster than combined LSTM+legacy
+  PSM 7 normal → early exit if valid plate found
+  PSM 7 inverted → early exit if valid plate found
+  PSM 8/13 (+ PSM 6 for full-image fallback) only if earlier passes fail
   char whitelist: A-Z 0-9
-  both polarities tried (normal + inverted)
      │
      ▼
 cleanRegistration()   strip non-alphanumeric, uppercase
@@ -56,6 +58,8 @@ instead of `PY61AUU`.
 | `js/app.js` | Added `detectPlateRegion()` – Sobel-X + morphological dilation + aspect-ratio scoring |
 | `js/app.js` | Rewrote `preprocessImage()` to crop to detected plate before scaling & binarising; now upscales small crops to give Tesseract more pixels |
 | `js/app.js` | Updated `runOCR()` to use only PSM 7/8/13 after a confirmed crop (was 4 modes × full image = 8 passes) |
+| `js/app.js` | Switched Tesseract worker from OEM 3 (combined LSTM+legacy) to OEM 1 (LSTM only) for faster recognition |
+| `js/app.js` | Added early-exit to the PSM loop: stops as soon as any pass returns a plate within the valid length range, typically reducing to 1 recognize() call instead of 6 |
 | `js/app.js` | Added `drawPlateOverlay()` – draws a green dashed box on the preview showing the detected plate region |
 | `index.html` | Added `<canvas id="plate-overlay">` inside the preview box |
 | `css/style.css` | Added `.plate-overlay` absolute positioning |
