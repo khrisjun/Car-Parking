@@ -18,8 +18,15 @@ const OCR_PLATE_WIDTH    = 800;  // target width when scaling a detected plate c
 const OCR_FULL_WIDTH     = 1200; // max width when falling back to full-image OCR (downscale only)
 const PLATE_DETECT_WIDTH = 640;  // working resolution for the plate-detection algorithm
 
-// Hard limit so OCR can't "cycle" for a minute; target is < 5s.
-const OCR_TIME_BUDGET_MS = 5000;
+// Soft time budget. When this is exceeded AND a valid-length plate has
+// already been found, further PSM passes are skipped. It is NOT used as a
+// hard cut-off: a recognize() call that is already in-flight is always
+// allowed to complete so that results are never discarded mid-recognition.
+const OCR_TIME_BUDGET_MS  = 5000;
+// Hard per-pass limit. If a single recognize() call is still running after
+// this long the worker is considered stuck and is restarted. Any result
+// accumulated in earlier passes is still shown to the user.
+const OCR_PASS_TIMEOUT_MS = 20000;
 
 function timeoutAfter(ms) {
   return new Promise((_, reject) => setTimeout(() => reject(new Error('OCR_TIMEOUT')), ms));
@@ -541,15 +548,17 @@ async function runOCR(imageSource) {
     if (!isLatestRun()) return;
     setOcrStatus('Reading registration…', true);
 
-    // Enforce a strict time budget. If we exceed it, stop trying further PSM
-    // passes and (best-effort) terminate the worker so users aren't stuck.
+    // ocrStart is used as a soft budget gate: if we have already found a
+    // valid-length plate and the budget is spent, we skip further passes.
+    // It is NOT used as a hard cut-off for in-flight recognise() calls.
     const ocrStart = performance.now();
 
     // Tight crop → single-line modes are most accurate.
     // Full-image fallback → also try block mode to catch plates with context.
     const PSM_MODES = plateRegion ? ['7', '8', '13'] : ['7', '6', '8', '13'];
-    let bestInRange = '';  // longest candidate within [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH]
-    let bestAny     = '';  // longest candidate regardless of length (fallback)
+    let bestInRange   = '';  // longest candidate within [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH]
+    let bestAny       = '';  // longest candidate regardless of length (fallback)
+    let passTimedOut  = false;
 
     const tryCandidate = (raw) => {
       const candidate = cleanRegistration(raw || '');
@@ -560,22 +569,43 @@ async function runOCR(imageSource) {
 
     for (const psm of PSM_MODES) {
       if (!isLatestRun()) return;
-      if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS) break;
-      await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
-      // Run on the standard (dark text on white) preprocessed image
-      const remainingMs1 = Math.max(0, OCR_TIME_BUDGET_MS - (performance.now() - ocrStart));
-      const { data: dataNormal } = await recognizeWithTimeout(normalUrl, remainingMs1);
-      console.debug(`[OCR] PSM ${psm} normal: "${dataNormal.text.trim()}"`);
-      tryCandidate(dataNormal.text);
-      // Early exit: a valid-length plate was found — no further passes needed
-      if (bestInRange.length > 0) break;
-      // Run on the inverted image to handle light-coloured characters on dark plates
-      const remainingMs2 = Math.max(0, OCR_TIME_BUDGET_MS - (performance.now() - ocrStart));
-      const { data: dataInvert } = await recognizeWithTimeout(invertUrl, remainingMs2);
-      console.debug(`[OCR] PSM ${psm} invert: "${dataInvert.text.trim()}"`);
-      tryCandidate(dataInvert.text);
-      // Early exit after inverted pass too
-      if (bestInRange.length > 0) break;
+      // Soft budget: skip extra passes only when a valid result is already in hand
+      if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS && bestInRange.length > 0) break;
+
+      try {
+        await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
+
+        // Run on the standard (dark text on white) preprocessed image.
+        // Each call gets the full per-pass timeout so a slow device still
+        // produces a result rather than being cut off mid-recognition.
+        const { data: dataNormal } = await recognizeWithTimeout(normalUrl, OCR_PASS_TIMEOUT_MS);
+        console.debug(`[OCR] PSM ${psm} normal: "${dataNormal.text.trim()}"`);
+        tryCandidate(dataNormal.text);
+        // Early exit: a valid-length plate was found — no further passes needed
+        if (bestInRange.length > 0) break;
+
+        // Run on the inverted image to handle light-coloured chars on dark plates
+        const { data: dataInvert } = await recognizeWithTimeout(invertUrl, OCR_PASS_TIMEOUT_MS);
+        console.debug(`[OCR] PSM ${psm} invert: "${dataInvert.text.trim()}"`);
+        tryCandidate(dataInvert.text);
+        // Early exit after inverted pass too
+        if (bestInRange.length > 0) break;
+
+      } catch (passErr) {
+        if (passErr.message === 'OCR_TIMEOUT') {
+          // The worker appears stuck.  Restart it in the background so the
+          // next scan works without a page reload, then break out — any result
+          // accumulated in earlier passes is still shown to the user.
+          console.warn(`[OCR] PSM ${psm} pass timed out — restarting worker; using best result so far`);
+          passTimedOut = true;
+          try { await tesseractWorker.terminate(); } catch (e) { console.debug('[OCR] Worker termination error:', e); }
+          tesseractWorker = null;
+          workerReady     = false;
+          initTesseract();
+          break;
+        }
+        throw passErr; // Re-throw unexpected errors to the outer catch
+      }
     }
 
     let best = bestInRange || bestAny;
@@ -595,23 +625,13 @@ async function runOCR(imageSource) {
       const regionNote = plateRegion ? '' : ' (full image — plate not isolated)';
       setOcrStatus(`Detected: ${best}${regionNote}`, false);
     } else {
-      setOcrStatus('Could not detect registration. Please type it manually.', false);
+      const msg = passTimedOut
+        ? 'OCR took too long — please type the registration manually.'
+        : 'Could not detect registration. Please type it manually.';
+      setOcrStatus(msg, false);
     }
   } catch (err) {
     if (!isLatestRun()) return;
-    if (err && err.message === 'OCR_TIMEOUT') {
-      console.warn('[OCR] Timed out; terminating worker and re-initialising');
-      setOcrStatus('OCR taking too long — please type the registration manually.', false);
-      try {
-        await tesseractWorker.terminate();
-      } catch {}
-      tesseractWorker = null;
-      workerReady = false;
-      // Re-initialise in the background so the next scan attempt works
-      // without requiring a manual page refresh.
-      initTesseract();
-      return;
-    }
     console.error('OCR error:', err);
     setOcrStatus('OCR failed. Please type the registration manually.', false);
   } finally {

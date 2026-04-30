@@ -79,6 +79,8 @@ All tuning constants are defined at the top of `js/app.js` for easy adjustment.
 | `PLATE_MIN_AR` / `PLATE_MAX_AR` | 2.0 / 8.5 | Accepted aspect-ratio range. UK standard plate ≈ 4.7 : 1. |
 | `PLATE_TARGET_AR` | 4.7 | Ideal aspect ratio used to score candidates. |
 | `AR_SCORE_WEIGHT` | 3 | How much the aspect-ratio score is weighted vs. the area score in candidate ranking. |
+| `OCR_TIME_BUDGET_MS` | 5000 | **Soft** budget (ms). If already exceeded _and_ a valid plate has been found, further PSM passes are skipped. Does not abort an in-flight recognise() call. |
+| `OCR_PASS_TIMEOUT_MS` | 20000 | **Hard** per-pass limit (ms). If a single recognise() call takes longer than this the worker is restarted; any results from earlier passes are still shown. |
 
 ### UK number plate format assumptions
 
@@ -97,6 +99,9 @@ Open the browser console after uploading a photo.  The pipeline logs:
 * `[OCR] No plate region detected — running OCR on full image` – fallback
   active.
 * `[OCR] PSM 7 normal: "PY61AUU"` – raw Tesseract output for each pass.
+* `[OCR] PSM 7 pass timed out — restarting worker; using best result so far` –
+  a single pass exceeded `OCR_PASS_TIMEOUT_MS`; earlier passes' results are
+  still used.
 
 A green dashed rectangle is also drawn on the preview image showing exactly
 which region was passed to OCR.
