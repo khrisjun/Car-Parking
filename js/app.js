@@ -26,6 +26,9 @@ function timeoutAfter(ms) {
 }
 
 async function recognizeWithTimeout(imageUrl, ms) {
+  if (ms <= 0) {
+    throw new Error('OCR_TIMEOUT');
+  }
   return Promise.race([
     tesseractWorker.recognize(imageUrl),
     timeoutAfter(ms),
@@ -517,6 +520,12 @@ async function runOCR(imageSource) {
   setOcrStatus('Detecting number plate…', true);
   validateBtn.disabled = true;
 
+  // Prevent concurrent OCR runs from stomping each other (e.g. user selects a
+  // second image while the first is still processing). Only the most recent run
+  // should be allowed to update the UI.
+  const runId = (runOCR._runId = (runOCR._runId || 0) + 1);
+  const isLatestRun = () => runId === runOCR._runId;
+
   try {
     const { normalUrl, invertUrl, plateRegion, naturalW, naturalH } = await preprocessImage(imageSource);
 
@@ -529,6 +538,7 @@ async function runOCR(imageSource) {
       console.warn('[OCR] No plate region detected — running OCR on full image');
     }
 
+    if (!isLatestRun()) return;
     setOcrStatus('Reading registration…', true);
 
     // Enforce a strict time budget. If we exceed it, stop trying further PSM
@@ -549,6 +559,7 @@ async function runOCR(imageSource) {
     };
 
     for (const psm of PSM_MODES) {
+      if (!isLatestRun()) return;
       if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS) break;
       await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
       // Run on the standard (dark text on white) preprocessed image
@@ -569,6 +580,8 @@ async function runOCR(imageSource) {
 
     let best = bestInRange || bestAny;
 
+    if (!isLatestRun()) return;
+
     if (best.length > 0) {
       // Apply UK plate format positional character corrections (O↔0, I↔1, etc.)
       best = correctOcrForUKPlate(best);
@@ -585,6 +598,7 @@ async function runOCR(imageSource) {
       setOcrStatus('Could not detect registration. Please type it manually.', false);
     }
   } catch (err) {
+    if (!isLatestRun()) return;
     if (err && err.message === 'OCR_TIMEOUT') {
       console.warn('[OCR] Timed out; terminating worker and re-initialising');
       setOcrStatus('OCR taking too long — please type the registration manually.', false);
@@ -601,7 +615,7 @@ async function runOCR(imageSource) {
     console.error('OCR error:', err);
     setOcrStatus('OCR failed. Please type the registration manually.', false);
   } finally {
-    validateBtn.disabled = false;
+    if (isLatestRun()) validateBtn.disabled = false;
   }
 }
 
