@@ -12,7 +12,7 @@ The app recognises number plates entirely in the browser using
 Photo / upload
      │
      ▼
-detectPlateRegion()          ← NEW: isolates the plate before OCR
+detectPlateRegion()          isolates the plate before OCR
   │  Sobel-X edges → binarise → horizontal dilation → vertical dilation
   │  → row-density bands → aspect-ratio filter (2:1 – 8.5:1, target 4.7:1)
   │  → best candidate padded and returned as {x,y,w,h}
@@ -22,19 +22,27 @@ detectPlateRegion()          ← NEW: isolates the plate before OCR
 preprocessImage()
   crop to detected region (or full image)
   scale crop to OCR_PLATE_WIDTH = 800 px  ← upscales small crops
-  greyscale → Laplacian sharpen → Otsu binarise
-  produces normal + inverted data-URLs
+  grayscale → Laplacian sharpen
+  produces three data-URLs:
+    grayUrl   – sharpened grayscale (LSTM prefers continuous tone)
+    normalUrl – Otsu-binarised dark-on-light
+    invertUrl – Otsu-binarised light-on-dark
      │
      ▼
-Tesseract.js OEM 1 (LSTM only) – faster than combined LSTM+legacy
-  PSM 7 normal → early exit if valid plate found
-  PSM 7 inverted → early exit if valid plate found
+Tesseract.js OEM 1 (LSTM only)
+  Per PSM mode, three image variants are tried in order (gray → normal → invert)
+  PSM 7 gray/normal/invert → early exit if valid plate found
   PSM 8/13 (+ PSM 6 for full-image fallback) only if earlier passes fail
-  char whitelist: A-Z 0-9
+  char whitelist: A-Z 0-9 (advisory; LSTM ignores it but cleanRegistration enforces it)
      │
      ▼
-cleanRegistration()   strip non-alphanumeric, uppercase
-length gate           5–8 characters
+tryCandidate()
+  cleanRegistration()   strip non-alphanumeric, uppercase (whole text)
+  line split            also test each newline-separated line independently
+                        (catches plates embedded in multi-line full-image OCR output)
+  length gate           5–8 characters
+     │
+     ▼
 correctOcrForUKPlate() positional O↔0 / I↔1 / etc. (7-char plates only)
 findFuzzyMatch()      Levenshtein ≤ 1 against stored registrations
      │
@@ -56,10 +64,13 @@ instead of `PY61AUU`.
 | `js/app.js` constants | Replaced `OCR_TARGET_WIDTH` (1600 px, full image) with `OCR_PLATE_WIDTH` (800 px, crop), `OCR_FULL_WIDTH` (1200 px, fallback cap), `PLATE_DETECT_WIDTH` (640 px, detector working size) |
 | `js/app.js` | Added `loadImage()` helper to DRY up image loading |
 | `js/app.js` | Added `detectPlateRegion()` – Sobel-X + morphological dilation + aspect-ratio scoring |
-| `js/app.js` | Rewrote `preprocessImage()` to crop to detected plate before scaling & binarising; now upscales small crops to give Tesseract more pixels |
-| `js/app.js` | Updated `runOCR()` to use only PSM 7/8/13 after a confirmed crop (was 4 modes × full image = 8 passes) |
+| `js/app.js` | Rewrote `preprocessImage()` to crop to detected plate before scaling & binarising; now upscales small crops to give Tesseract more pixels; also produces a sharpened grayscale data-URL as primary input for LSTM |
+| `js/app.js` | Updated `runOCR()` to try three image variants per PSM pass (grayscale → binarised → inverted); grayscale is first because LSTM neural net prefers continuous-tone images |
+| `js/app.js` | Updated `tryCandidate()` to also split OCR output by newlines and test each line independently; fixes the case where full-image OCR embeds the plate in multi-line output |
+| `js/app.js` | Added `silent` parameter to `initTesseract()` so worker restarts during an active OCR run no longer override the OCR status message with "OCR engine ready" |
+| `js/app.js` | Changed `initTesseract()` call in OCR timeout handler to `initTesseract(true)` (silent) |
 | `js/app.js` | Switched Tesseract worker from OEM 3 (combined LSTM+legacy) to OEM 1 (LSTM only) for faster recognition |
-| `js/app.js` | Added early-exit to the PSM loop: stops as soon as any pass returns a plate within the valid length range, typically reducing to 1 recognize() call instead of 6 |
+| `js/app.js` | Added early-exit to the PSM loop: stops as soon as any pass returns a plate within the valid length range, typically reducing to 1 recognize() call instead of many |
 | `js/app.js` | Added `drawPlateOverlay()` – draws a green dashed box on the preview showing the detected plate region |
 | `index.html` | Added `<canvas id="plate-overlay">` inside the preview box |
 | `css/style.css` | Added `.plate-overlay` absolute positioning |
@@ -98,7 +109,8 @@ Open the browser console after uploading a photo.  The pipeline logs:
   original image.
 * `[OCR] No plate region detected — running OCR on full image` – fallback
   active.
-* `[OCR] PSM 7 normal: "PY61AUU"` – raw Tesseract output for each pass.
+* `[OCR] PSM 7 gray: "PY61AUU"` – raw Tesseract output for each image variant
+  and PSM mode (variants: `gray`, `normal`, `invert`).
 * `[OCR] PSM 7 pass timed out — restarting worker; using best result so far` –
   a single pass exceeded `OCR_PASS_TIMEOUT_MS`; earlier passes' results are
   still used.
