@@ -86,9 +86,13 @@ function seedDefaultRegistrations() {
   }
 }
 
-/** Initialise Tesseract worker (eng, alphanumeric chars only) */
-async function initTesseract() {
-  setOcrStatus('Loading OCR engine…', true);
+/**
+ * Initialise Tesseract worker (eng, alphanumeric chars only).
+ * @param {boolean} [silent=false] - When true (worker restart after OCR timeout)
+ *   status messages are suppressed so they don't override an in-progress OCR run.
+ */
+async function initTesseract(silent = false) {
+  if (!silent) setOcrStatus('Loading OCR engine…', true);
   try {
     // OEM 1 = LSTM neural net only — substantially faster than the combined
     // LSTM+legacy engine (OEM 3) while retaining excellent accuracy for
@@ -102,11 +106,13 @@ async function initTesseract() {
       preserve_interword_spaces: '0',
     });
     workerReady = true;
-    setOcrStatus('OCR engine ready', false);
-    setTimeout(() => setOcrStatus('', false), 2000);
+    if (!silent) {
+      setOcrStatus('OCR engine ready', false);
+      setTimeout(() => setOcrStatus('', false), 2000);
+    }
   } catch (err) {
     console.error('Tesseract init error:', err);
-    setOcrStatus('OCR engine failed to load. You can still type the registration manually.', false);
+    if (!silent) setOcrStatus('OCR engine failed to load. You can still type the registration manually.', false);
   }
 }
 
@@ -167,7 +173,7 @@ function loadImage(src) {
  *
  * Algorithm (all processing at PLATE_DETECT_WIDTH for speed):
  *   1. Downscale to PLATE_DETECT_WIDTH.
- *   2. Convert to greyscale.
+ *   2. Convert to grayscale.
  *   3. Compute Sobel-X magnitude (highlights vertical character strokes,
  *      which are the dominant edge feature on a number plate).
  *   4. Binarise at SOBEL_THRESH.
@@ -416,14 +422,18 @@ function applySharpening(gray, w, h) {
  *   3. Scale the crop to OCR_PLATE_WIDTH (always — upscaling a small crop gives
  *      Tesseract more pixels to classify; downscaling removes noise from very
  *      large camera images).  Full-image fallback is capped at OCR_FULL_WIDTH.
- *   4. Convert to greyscale.
+ *   4. Convert to grayscale.
  *   5. Sharpen with the Laplacian kernel to accentuate character edges.
- *   6. Binarise with Otsu's adaptive threshold.
- *   7. Produce both a normal (dark-on-light) and an inverted copy (some plates
+ *   6. Produce a sharpened grayscale data-URL (grayUrl) — the LSTM neural net
+ *      reads continuous-tone images better than binarised ones, so this is tried
+ *      first in the OCR loop.
+ *   7. Binarise with Otsu's adaptive threshold.
+ *   8. Produce both a normal (dark-on-light) and an inverted copy (some plates
  *      have light characters on a dark surface; Tesseract prefers dark-on-light).
  *
- * Returns { normalUrl, invertUrl, plateRegion } where plateRegion is the
- * detected crop rectangle ({x,y,w,h}) or null for full-image fallback.
+ * Returns { grayUrl, normalUrl, invertUrl, plateRegion, naturalW, naturalH }
+ * where plateRegion is the detected crop rectangle ({x,y,w,h}) or null for
+ * full-image fallback.
  */
 async function preprocessImage(src) {
   const plateRegion = await detectPlateRegion(src);
@@ -472,6 +482,18 @@ async function preprocessImage(src) {
   // --- Sharpen ---
   const sharpened = applySharpening(gray, w, h);
 
+  // --- Grayscale URL (sharpened, not binarised) ---
+  // The LSTM engine reads continuous-tone images better than pure black/white;
+  // providing grayscale as the primary input improves recognition accuracy.
+  const grayData = ctx.createImageData(w, h);
+  for (let i = 0; i < w * h; i++) {
+    const v = sharpened[i];
+    grayData.data[i * 4]     = grayData.data[i * 4 + 1] = grayData.data[i * 4 + 2] = v;
+    grayData.data[i * 4 + 3] = 255;
+  }
+  ctx.putImageData(grayData, 0, 0);
+  const grayUrl = canvas.toDataURL('image/png');
+
   // --- Otsu binarisation ---
   const threshold = computeOtsuThreshold(sharpened);
 
@@ -495,7 +517,7 @@ async function preprocessImage(src) {
   ctx.putImageData(invertData, 0, 0);
   const invertUrl = canvas.toDataURL('image/png');
 
-  return { normalUrl, invertUrl, plateRegion, naturalW: fullW, naturalH: fullH };
+  return { grayUrl, normalUrl, invertUrl, plateRegion, naturalW: fullW, naturalH: fullH };
 }
 
 /**
@@ -509,9 +531,15 @@ async function preprocessImage(src) {
  * automatic fallbacks for awkward lighting or unusual plate layouts.
  *
  * When a plate region is detected, PSM 7, 8 and 13 are tried (up to
- * 3 modes × 2 polarities = 6 passes) because the tight crop makes block-mode
+ * 3 modes × 3 variants = 9 passes) because the tight crop makes block-mode
  * PSMs unreliable.  Without a crop the full four-mode sweep is retained as a
  * fallback.
+ *
+ * Per PSM pass the image is tried in three variants (in order):
+ *   1. Grayscale (sharpened, not binarised) — LSTM neural net prefers continuous
+ *      tone images; this is the most reliable input for typical plate photos.
+ *   2. Normal binarised (dark text on white) — good for clean, high-contrast crops.
+ *   3. Inverted binarised (white text on dark) — catches dark-background plates.
  *
  * PSM 7  – single text line  (best for a standard plate like "GF23 XWD")
  * PSM 8  – single word       (compact plates with no visible space)
@@ -534,7 +562,7 @@ async function runOCR(imageSource) {
   const isLatestRun = () => runId === runOCR._runId;
 
   try {
-    const { normalUrl, invertUrl, plateRegion, naturalW, naturalH } = await preprocessImage(imageSource);
+    const { grayUrl, normalUrl, invertUrl, plateRegion, naturalW, naturalH } = await preprocessImage(imageSource);
 
     // Show (or hide) the detection overlay on the preview
     drawPlateOverlay(plateRegion, naturalW, naturalH);
@@ -560,14 +588,42 @@ async function runOCR(imageSource) {
     let bestAny       = '';  // longest candidate regardless of length (fallback)
     let passTimedOut  = false;
 
+    /**
+     * Test a single raw OCR string and update bestInRange / bestAny.
+     * Also splits the text by newlines so that a multi-line full-image result
+     * (e.g. "FORD FOCUS\nAB12CDE\n") can yield the embedded plate "AB12CDE".
+     */
     const tryCandidate = (raw) => {
-      const candidate = cleanRegistration(raw || '');
-      const inRange = candidate.length >= MIN_PLATE_LENGTH && candidate.length <= MAX_PLATE_LENGTH;
-      if (inRange && candidate.length > bestInRange.length) bestInRange = candidate;
-      if (candidate.length > bestAny.length) bestAny = candidate;
+      const updateBests = (candidate) => {
+        if (!candidate) return;
+        const inRange = candidate.length >= MIN_PLATE_LENGTH && candidate.length <= MAX_PLATE_LENGTH;
+        if (inRange && candidate.length > bestInRange.length) bestInRange = candidate;
+        if (candidate.length > bestAny.length) bestAny = candidate;
+      };
+
+      // Test the full text as one cleaned string
+      updateBests(cleanRegistration(raw || ''));
+
+      // Also test each individual line – critical when OCR runs on the full image
+      // and the plate is on one line among several lines of text.
+      const lines = (raw || '').split(/[\n\r]+/).map(l => l.trim()).filter(l => l.length > 0);
+      if (lines.length > 1) {
+        for (const line of lines) {
+          updateBests(cleanRegistration(line));
+        }
+      }
     };
 
-    for (const psm of PSM_MODES) {
+    // Image variants tried per PSM pass, in order of expected quality for LSTM.
+    // Grayscale is first because the LSTM neural net reads continuous-tone images
+    // better than pure black-and-white.
+    const IMAGE_VARIANTS = [
+      { url: grayUrl,    label: 'gray'   },
+      { url: normalUrl,  label: 'normal' },
+      { url: invertUrl,  label: 'invert' },
+    ];
+
+    outer: for (const psm of PSM_MODES) {
       if (!isLatestRun()) return;
       // Soft budget: skip extra passes only when a valid result is already in hand
       if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS && bestInRange.length > 0) break;
@@ -575,33 +631,30 @@ async function runOCR(imageSource) {
       try {
         await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
 
-        // Run on the standard (dark text on white) preprocessed image.
-        // Each call gets the full per-pass timeout so a slow device still
-        // produces a result rather than being cut off mid-recognition.
-        const { data: dataNormal } = await recognizeWithTimeout(normalUrl, OCR_PASS_TIMEOUT_MS);
-        console.debug(`[OCR] PSM ${psm} normal: "${dataNormal.text.trim()}"`);
-        tryCandidate(dataNormal.text);
-        // Early exit: a valid-length plate was found — no further passes needed
-        if (bestInRange.length > 0) break;
-
-        // Run on the inverted image to handle light-coloured chars on dark plates
-        const { data: dataInvert } = await recognizeWithTimeout(invertUrl, OCR_PASS_TIMEOUT_MS);
-        console.debug(`[OCR] PSM ${psm} invert: "${dataInvert.text.trim()}"`);
-        tryCandidate(dataInvert.text);
-        // Early exit after inverted pass too
-        if (bestInRange.length > 0) break;
+        for (const variant of IMAGE_VARIANTS) {
+          if (!isLatestRun()) return;
+          // Each call gets the full per-pass timeout so a slow device still
+          // produces a result rather than being cut off mid-recognition.
+          const { data } = await recognizeWithTimeout(variant.url, OCR_PASS_TIMEOUT_MS);
+          console.debug(`[OCR] PSM ${psm} ${variant.label}: "${data.text.trim()}"`);
+          tryCandidate(data.text);
+          // Early exit: a valid-length plate was found — no further passes needed
+          if (bestInRange.length > 0) break outer;
+        }
 
       } catch (passErr) {
         if (passErr.message === 'OCR_TIMEOUT') {
           // The worker appears stuck.  Restart it in the background so the
           // next scan works without a page reload, then break out — any result
           // accumulated in earlier passes is still shown to the user.
+          // silent=true prevents the restart messages from overriding the OCR
+          // status that is about to be set below.
           console.warn(`[OCR] PSM ${psm} pass timed out — restarting worker; using best result so far`);
           passTimedOut = true;
           try { await tesseractWorker.terminate(); } catch (e) { console.debug('[OCR] Worker termination error:', e); }
           tesseractWorker = null;
           workerReady     = false;
-          initTesseract();
+          initTesseract(true /* silent */);
           break;
         }
         throw passErr; // Re-throw unexpected errors to the outer catch
