@@ -70,8 +70,9 @@ const resultSub      = document.getElementById('result-sub');
 const tryAgainBtn    = document.getElementById('try-again-btn');
 
 // ─── State ────────────────────────────────────────────────────────────────────
-let tesseractWorker  = null;
-let workerReady      = false;
+let tesseractWorker       = null;
+let workerReady           = false;
+let _ocrStatusClearTimer  = null; // tracks the post-init "OCR engine ready" clear timer
 
 // ─── Initialise ───────────────────────────────────────────────────────────────
 (async function init() {
@@ -108,7 +109,7 @@ async function initTesseract(silent = false) {
     workerReady = true;
     if (!silent) {
       setOcrStatus('OCR engine ready', false);
-      setTimeout(() => setOcrStatus('', false), 2000);
+      _ocrStatusClearTimer = setTimeout(() => setOcrStatus('', false), 2000);
     }
   } catch (err) {
     console.error('Tesseract init error:', err);
@@ -471,6 +472,12 @@ async function preprocessImage(src) {
   // Draw only the plate crop, scaled to fill canvas
   ctx.drawImage(img, cropX, cropY, cropW, cropH, 0, 0, w, h);
 
+  // --- Colour crop URL (before any processing) ---
+  // LSTM is trained on colour images and often reads them more accurately than
+  // binarised or grayscale versions, especially under mixed lighting.  Capture
+  // the colour crop before converting to greyscale.
+  const colorUrl = canvas.toDataURL('image/png');
+
   // --- Grayscale ---
   const imgData = ctx.getImageData(0, 0, w, h);
   const d = imgData.data;
@@ -517,7 +524,7 @@ async function preprocessImage(src) {
   ctx.putImageData(invertData, 0, 0);
   const invertUrl = canvas.toDataURL('image/png');
 
-  return { grayUrl, normalUrl, invertUrl, plateRegion, naturalW: fullW, naturalH: fullH };
+  return { colorUrl, grayUrl, normalUrl, invertUrl, plateRegion, naturalW: fullW, naturalH: fullH };
 }
 
 /**
@@ -547,6 +554,10 @@ async function preprocessImage(src) {
  * PSM 6  – uniform text block (fallback for full-image mode only)
  */
 async function runOCR(imageSource) {
+  // Cancel any pending "OCR engine ready" status clear so it doesn't wipe the
+  // in-progress spinner while OCR is running.
+  clearTimeout(_ocrStatusClearTimer);
+
   if (!workerReady) {
     setOcrStatus('OCR not ready. Please type the registration manually.', false);
     return;
@@ -562,7 +573,7 @@ async function runOCR(imageSource) {
   const isLatestRun = () => runId === runOCR._runId;
 
   try {
-    const { grayUrl, normalUrl, invertUrl, plateRegion, naturalW, naturalH } = await preprocessImage(imageSource);
+    const { colorUrl, grayUrl, normalUrl, invertUrl, plateRegion, naturalW, naturalH } = await preprocessImage(imageSource);
 
     // Show (or hide) the detection overlay on the preview
     drawPlateOverlay(plateRegion, naturalW, naturalH);
@@ -590,8 +601,17 @@ async function runOCR(imageSource) {
 
     /**
      * Test a single raw OCR string and update bestInRange / bestAny.
-     * Also splits the text by newlines so that a multi-line full-image result
-     * (e.g. "FORD FOCUS\nAB12CDE\n") can yield the embedded plate "AB12CDE".
+     *
+     * Two strategies are used:
+     *   1. Full clean — the entire OCR string stripped of non-alphanumerics.
+     *      Handles a plate-only result ("AB12CDE") and plates with spaces
+     *      ("AB12 CDE" → "AB12CDE") in one step.
+     *   2. Token split — split the raw text on any whitespace (covers both
+     *      newlines from PSM 6 block output and spaces from PSM 7 single-line
+     *      output, e.g. "FORD FOCUS AB12CDE").  Each token is only accepted as
+     *      a candidate if it contains BOTH letters AND digits — this mimics
+     *      the mixed-character pattern of a real number plate and avoids false
+     *      positives from plain English words like "FOCUS" or "FORD".
      */
     const tryCandidate = (raw) => {
       const updateBests = (candidate) => {
@@ -601,23 +621,31 @@ async function runOCR(imageSource) {
         if (candidate.length > bestAny.length) bestAny = candidate;
       };
 
-      // Test the full text as one cleaned string
+      // Strategy 1: test the full text as one cleaned string
       updateBests(cleanRegistration(raw || ''));
 
-      // Also test each individual line – critical when OCR runs on the full image
-      // and the plate is on one line among several lines of text.
-      const lines = (raw || '').split(/[\n\r]+/).map(l => l.trim()).filter(l => l.length > 0);
-      if (lines.length > 1) {
-        for (const line of lines) {
-          updateBests(cleanRegistration(line));
+      // Strategy 2: test each whitespace-separated token (newlines and spaces)
+      // Only tokens that contain BOTH at least one letter and at least one digit
+      // are considered, matching the mixed alpha-numeric pattern of a plate and
+      // avoiding plain English words from surrounding scene text.
+      const tokens = (raw || '').split(/\s+/).filter(t => t.length > 0);
+      if (tokens.length > 1) {
+        for (const token of tokens) {
+          const clean = cleanRegistration(token);
+          if (/[A-Z]/.test(clean) && /[0-9]/.test(clean)) {
+            updateBests(clean);
+          }
         }
       }
     };
 
     // Image variants tried per PSM pass, in order of expected quality for LSTM.
-    // Grayscale is first because the LSTM neural net reads continuous-tone images
-    // better than pure black-and-white.
+    // Colour is tried first: Tesseract LSTM is trained on colour images and
+    // frequently outperforms binarised or greyscale inputs, especially under
+    // mixed or uneven lighting.  Greyscale (sharpened) is the next best option;
+    // binarised variants (normal / inverted) serve as further fallbacks.
     const IMAGE_VARIANTS = [
+      { url: colorUrl,   label: 'color'  },
       { url: grayUrl,    label: 'gray'   },
       { url: normalUrl,  label: 'normal' },
       { url: invertUrl,  label: 'invert' },
