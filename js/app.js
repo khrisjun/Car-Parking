@@ -27,6 +27,28 @@ const OCR_TIME_BUDGET_MS  = 5000;
 // this long the worker is considered stuck and is restarted. Any result
 // accumulated in earlier passes is still shown to the user.
 const OCR_PASS_TIMEOUT_MS = 20000;
+const REG_MATCH_MIN_SCORE = 0.68;
+
+const COMMON_CONFUSIONS = {
+  O: ['0', 'Q', 'D'],
+  0: ['O', 'Q', 'D'],
+  I: ['1', 'L', 'T'],
+  1: ['I', 'L', 'T'],
+  S: ['5'],
+  5: ['S'],
+  B: ['8'],
+  8: ['B'],
+  Z: ['2'],
+  2: ['Z'],
+  G: ['6'],
+  6: ['G'],
+  A: ['4'],
+  4: ['A'],
+  U: ['V'],
+  V: ['U'],
+  W: ['M'],
+  M: ['W'],
+};
 
 function timeoutAfter(ms) {
   return new Promise((_, reject) => setTimeout(() => reject(new Error('OCR_TIMEOUT')), ms));
@@ -528,25 +550,12 @@ async function preprocessImage(src) {
 }
 
 /**
- * Run OCR using multiple Tesseract page-segmentation modes (PSM) on both the
- * normal and the inverted preprocessed plate crop, then return the best result.
+ * Run OCR using multiple Tesseract page-segmentation modes (PSM) and aggregate
+ * observations to infer the most likely registration.
  *
- * Passes are tried in order and the loop exits as soon as any pass returns a
- * candidate within [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH].  For a clear plate
- * crop (the common case) this means only one recognize() call is needed,
- * keeping total OCR time well under five seconds.  Subsequent modes serve as
- * automatic fallbacks for awkward lighting or unusual plate layouts.
- *
- * When a plate region is detected, PSM 7, 8 and 13 are tried (up to
- * 3 modes × 3 variants = 9 passes) because the tight crop makes block-mode
- * PSMs unreliable.  Without a crop the full four-mode sweep is retained as a
- * fallback.
- *
- * Per PSM pass the image is tried in three variants (in order):
- *   1. Grayscale (sharpened, not binarised) — LSTM neural net prefers continuous
- *      tone images; this is the most reliable input for typical plate photos.
- *   2. Normal binarised (dark text on white) — good for clean, high-contrast crops.
- *   3. Inverted binarised (white text on dark) — catches dark-background plates.
+ * Passes are tried in order. Instead of trusting one cleaned OCR string, every
+ * pass contributes evidence, then the app scores known registrations against all
+ * observations using confusion-aware weighted edit distance.
  *
  * PSM 7  – single text line  (best for a standard plate like "GF23 XWD")
  * PSM 8  – single word       (compact plates with no visible space)
@@ -587,57 +596,14 @@ async function runOCR(imageSource) {
     if (!isLatestRun()) return;
     setOcrStatus('Reading registration…', true);
 
-    // ocrStart is used as a soft budget gate: if we have already found a
-    // valid-length plate and the budget is spent, we skip further passes.
-    // It is NOT used as a hard cut-off for in-flight recognise() calls.
+    // Soft budget gate for extra passes; in-flight recognise() calls always finish.
     const ocrStart = performance.now();
 
     // Tight crop → single-line modes are most accurate.
     // Full-image fallback → also try block mode to catch plates with context.
     const PSM_MODES = plateRegion ? ['7', '8', '13'] : ['7', '6', '8', '13'];
-    let bestInRange   = '';  // longest candidate within [MIN_PLATE_LENGTH, MAX_PLATE_LENGTH]
-    let bestAny       = '';  // longest candidate regardless of length (fallback)
+    const observations = [];
     let passTimedOut  = false;
-
-    /**
-     * Test a single raw OCR string and update bestInRange / bestAny.
-     *
-     * Two strategies are used:
-     *   1. Full clean — the entire OCR string stripped of non-alphanumerics.
-     *      Handles a plate-only result ("AB12CDE") and plates with spaces
-     *      ("AB12 CDE" → "AB12CDE") in one step.
-     *   2. Token split — split the raw text on any whitespace (covers both
-     *      newlines from PSM 6 block output and spaces from PSM 7 single-line
-     *      output, e.g. "FORD FOCUS AB12CDE").  Each token is only accepted as
-     *      a candidate if it contains BOTH letters AND digits — this mimics
-     *      the mixed-character pattern of a real number plate and avoids false
-     *      positives from plain English words like "FOCUS" or "FORD".
-     */
-    const tryCandidate = (raw) => {
-      const updateBests = (candidate) => {
-        if (!candidate) return;
-        const inRange = candidate.length >= MIN_PLATE_LENGTH && candidate.length <= MAX_PLATE_LENGTH;
-        if (inRange && candidate.length > bestInRange.length) bestInRange = candidate;
-        if (candidate.length > bestAny.length) bestAny = candidate;
-      };
-
-      // Strategy 1: test the full text as one cleaned string
-      updateBests(cleanRegistration(raw || ''));
-
-      // Strategy 2: test each whitespace-separated token (newlines and spaces)
-      // Only tokens that contain BOTH at least one letter and at least one digit
-      // are considered, matching the mixed alpha-numeric pattern of a plate and
-      // avoiding plain English words from surrounding scene text.
-      const tokens = (raw || '').split(/\s+/).filter(t => t.length > 0);
-      if (tokens.length > 1) {
-        for (const token of tokens) {
-          const clean = cleanRegistration(token);
-          if (/[A-Z]/.test(clean) && /[0-9]/.test(clean)) {
-            updateBests(clean);
-          }
-        }
-      }
-    };
 
     // Image variants tried per PSM pass, in order of expected quality for LSTM.
     // Colour is tried first: Tesseract LSTM is trained on colour images and
@@ -651,10 +617,10 @@ async function runOCR(imageSource) {
       { url: invertUrl,  label: 'invert' },
     ];
 
-    outer: for (const psm of PSM_MODES) {
+    for (const psm of PSM_MODES) {
       if (!isLatestRun()) return;
-      // Soft budget: skip extra passes only when a valid result is already in hand
-      if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS && bestInRange.length > 0) break;
+      // Soft budget: if we already have enough observations, skip extra passes.
+      if (performance.now() - ocrStart > OCR_TIME_BUDGET_MS && observations.length > 0) break;
 
       try {
         await tesseractWorker.setParameters({ tessedit_pageseg_mode: psm });
@@ -664,10 +630,11 @@ async function runOCR(imageSource) {
           // Each call gets the full per-pass timeout so a slow device still
           // produces a result rather than being cut off mid-recognition.
           const { data } = await recognizeWithTimeout(variant.url, OCR_PASS_TIMEOUT_MS);
-          console.debug(`[OCR] PSM ${psm} ${variant.label}: "${data.text.trim()}"`);
-          tryCandidate(data.text);
-          // Early exit: a valid-length plate was found — no further passes needed
-          if (bestInRange.length > 0) break outer;
+          const rawText = (data.text || '').trim();
+          console.debug(`[OCR] PSM ${psm} ${variant.label}: "${rawText}"`);
+          if (!rawText) continue;
+          const confidence = Number.isFinite(data.confidence) ? data.confidence : 0;
+          observations.push(...extractObservationCandidates(rawText, confidence));
         }
 
       } catch (passErr) {
@@ -689,22 +656,17 @@ async function runOCR(imageSource) {
       }
     }
 
-    let best = bestInRange || bestAny;
+    const registrations = getRegistrations().map(normalise);
+    const regMatch = pickBestRegistrationMatch(observations, registrations);
+    let best = regMatch ? regMatch.registration : pickBestRawObservation(observations);
 
     if (!isLatestRun()) return;
 
     if (best.length > 0) {
-      // Apply UK plate format positional character corrections (O↔0, I↔1, etc.)
-      best = correctOcrForUKPlate(best);
-
-      // Fuzzy-match against stored registrations (edit distance ≤ 1) to catch
-      // single-character misreads such as W being read as H
-      const fuzzy = findFuzzyMatch(best, getRegistrations());
-      if (fuzzy) best = fuzzy;
-
       regInput.value = best;
       const regionNote = plateRegion ? '' : ' (full image — plate not isolated)';
-      setOcrStatus(`Detected: ${best}${regionNote}`, false);
+      const statusPrefix = regMatch ? 'Detected (matched): ' : 'Detected: ';
+      setOcrStatus(`${statusPrefix}${best}${regionNote}`, false);
     } else {
       const msg = passTimedOut
         ? 'OCR took too long — please type the registration manually.'
@@ -726,60 +688,98 @@ function cleanRegistration(raw) {
 }
 
 /**
- * Apply positional character corrections for the standard UK plate format
- * LL00LLL (2 letters, 2 digits, 3 letters).  OCR commonly confuses visually
- * similar characters: O/0, I/1, S/5, B/8, Z/2, G/6, A/4.
- * Only applied when the candidate is exactly 7 characters.
+ * Extract candidate plate-like strings from raw OCR output.
  */
-function correctOcrForUKPlate(text) {
-  if (text.length !== 7) return text;
-  const DIGIT_TO_LETTER = { '0': 'O', '1': 'I', '5': 'S', '8': 'B', '2': 'Z', '6': 'G', '4': 'A' };
-  const LETTER_TO_DIGIT = { O: '0', I: '1', L: '1', S: '5', B: '8', Z: '2', G: '6', A: '4', T: '1' };
-  const chars = text.split('');
-  // Positions 0,1,4,5,6 should be letters – fix any stray digit
-  [0, 1, 4, 5, 6].forEach(i => {
-    if (/[0-9]/.test(chars[i]) && DIGIT_TO_LETTER[chars[i]]) {
-      chars[i] = DIGIT_TO_LETTER[chars[i]];
+function extractObservationCandidates(rawText, confidence) {
+  const seen = new Set();
+  const out = [];
+  const push = (candidate, weightBoost = 0) => {
+    if (!candidate) return;
+    if (candidate.length < MIN_PLATE_LENGTH || candidate.length > MAX_PLATE_LENGTH) return;
+    if (!/[A-Z]/.test(candidate) || !/[0-9]/.test(candidate)) return;
+    if (seen.has(candidate)) return;
+    seen.add(candidate);
+    out.push({ candidate, confidence: Math.max(0, confidence + weightBoost) });
+  };
+
+  const cleanedAll = cleanRegistration(rawText);
+  for (let len = MIN_PLATE_LENGTH; len <= MAX_PLATE_LENGTH; len++) {
+    if (cleanedAll.length < len) continue;
+    for (let i = 0; i <= cleanedAll.length - len; i++) {
+      push(cleanedAll.slice(i, i + len), -8);
     }
-  });
-  // Positions 2,3 should be digits – fix any stray letter
-  [2, 3].forEach(i => {
-    if (/[A-Z]/.test(chars[i]) && LETTER_TO_DIGIT[chars[i]]) {
-      chars[i] = LETTER_TO_DIGIT[chars[i]];
-    }
-  });
-  return chars.join('');
+  }
+
+  const tokens = rawText.split(/\s+/).filter(Boolean);
+  for (const token of tokens) {
+    const clean = cleanRegistration(token);
+    push(clean, 8);
+  }
+
+  return out;
 }
 
-/** Levenshtein edit distance between two strings */
-function levenshtein(a, b) {
+function substitutionCost(a, b) {
+  if (a === b) return 0;
+  if ((COMMON_CONFUSIONS[a] || []).includes(b)) return 0.35;
+  if ((COMMON_CONFUSIONS[b] || []).includes(a)) return 0.35;
+  return 1;
+}
+
+/** Confusion-aware weighted edit distance between two strings */
+function weightedLevenshtein(a, b) {
   const m = a.length, n = b.length;
   const dp = Array.from({ length: m + 1 }, (_, i) => {
-    const row = new Array(n + 1).fill(0);
+    const row = new Array(n + 1).fill(0.0);
     row[0] = i;
     return row;
   });
   for (let j = 0; j <= n; j++) dp[0][j] = j;
   for (let i = 1; i <= m; i++) {
     for (let j = 1; j <= n; j++) {
-      dp[i][j] = a[i - 1] === b[j - 1]
-        ? dp[i - 1][j - 1]
-        : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
+      const subst = dp[i - 1][j - 1] + substitutionCost(a[i - 1], b[j - 1]);
+      const del = dp[i - 1][j] + 1;
+      const ins = dp[i][j - 1] + 1;
+      dp[i][j] = Math.min(subst, del, ins);
     }
   }
   return dp[m][n];
 }
 
 /**
- * Find a stored registration within edit-distance 1 of the candidate.
- * Returns the matched registration (normalised, spaces stripped) or null.
+ * Score known registrations against OCR observations and return the best match.
  */
-function findFuzzyMatch(candidate, registrations) {
-  for (const reg of registrations) {
-    const norm = reg.replace(/\s/g, '').toUpperCase();
-    if (levenshtein(candidate, norm) <= 1) return norm;
+function pickBestRegistrationMatch(observations, registrations) {
+  if (!observations.length || !registrations.length) return null;
+  let best = null;
+
+  for (const registration of registrations) {
+    let bestScoreForReg = 0;
+    for (const observation of observations) {
+      const dist = weightedLevenshtein(observation.candidate, registration);
+      const normDist = dist / Math.max(observation.candidate.length, registration.length, 1);
+      const similarity = Math.max(0, 1 - normDist);
+      const confidenceBoost = Math.min(Math.max(observation.confidence, 0), 100) / 100 * 0.2;
+      const score = similarity * 0.8 + confidenceBoost;
+      if (score > bestScoreForReg) bestScoreForReg = score;
+    }
+    if (!best || bestScoreForReg > best.score) {
+      best = { registration, score: bestScoreForReg };
+    }
   }
-  return null;
+
+  if (!best || best.score < REG_MATCH_MIN_SCORE) return null;
+  return best;
+}
+
+/** Fallback when no strong known-registration match exists. */
+function pickBestRawObservation(observations) {
+  if (!observations.length) return '';
+  observations.sort((a, b) => {
+    if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+    return b.candidate.length - a.candidate.length;
+  });
+  return observations[0].candidate;
 }
 
 // ─── Validation ───────────────────────────────────────────────────────────────
